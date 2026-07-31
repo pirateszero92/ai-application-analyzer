@@ -221,17 +221,20 @@ export default function Benchmark({ token, API_BASE }) {
       .catch(err => console.error("Error deleting report:", err));
   };
 
-  // Preset shortcuts
-  const applyPresetQuery = (type) => {
-    if (type === 'stat_activity') {
-      setName('PostgreSQL Active Session Load Test');
-      setSqlQuery('SELECT count(*), max(pid) FROM pg_stat_activity;');
-    } else if (type === 'stat_db') {
-      setName('PostgreSQL DB Stats Benchmark');
-      setSqlQuery('SELECT datname, numbackends FROM pg_stat_database LIMIT 10;');
-    } else if (type === 'raw_ping') {
-      setName('PostgreSQL Raw Connection Ping');
+  // Preset shortcuts (4 Stress Levels)
+  const applyPresetQuery = (level) => {
+    if (level === 'light') {
+      setName('🟢 Light Load - Connection Ping Test');
       setSqlQuery('SELECT pg_backend_pid(), current_timestamp;');
+    } else if (level === 'medium') {
+      setName('🟡 Medium Load - Active Sessions & Wait Events Scan');
+      setSqlQuery("SELECT state, wait_event_type, wait_event, count(*) FROM pg_stat_activity WHERE state != 'idle' GROUP BY state, wait_event_type, wait_event;");
+    } else if (level === 'heavy') {
+      setName('🟠 Heavy Load - DB Buffer Cache & Aggregation');
+      setSqlQuery('SELECT datname, count(*), sum(numbackends), sum(xact_commit), sum(xact_rollback), sum(blks_read), sum(blks_hit), round(sum(blks_hit)*100.0/nullif(sum(blks_hit)+sum(blks_read),0), 2) AS cache_hit_ratio FROM pg_stat_database GROUP BY datname ORDER BY sum(blks_read) DESC;');
+    } else if (level === 'extreme') {
+      setName('🔴 Extreme Load - 1K Row Synthetic MD5 Math Stress');
+      setSqlQuery('SELECT md5(concat(g.i::text, current_timestamp::text, random()::text)), sqrt(g.i::float), sin(g.i::float)*cos(g.i::float) FROM generate_series(1, 1000) AS g(i);');
     }
   };
 
@@ -577,31 +580,39 @@ export default function Benchmark({ token, API_BASE }) {
                     <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Preset Shortcuts:</span>
                   </label>
                   
-                  {/* Preset Shortcuts Buttons */}
+                  {/* 4 Stress Levels Preset Buttons */}
                   <div style={{ display: 'flex', gap: '6px', marginBottom: '8px', flexWrap: 'wrap' }}>
                     <button
                       type="button"
                       className="btn-secondary"
-                      style={{ padding: '4px 10px', fontSize: '0.75rem' }}
-                      onClick={() => applyPresetQuery('stat_activity')}
+                      style={{ padding: '4px 10px', fontSize: '0.75rem', borderColor: '#34d399', color: '#34d399' }}
+                      onClick={() => applyPresetQuery('light')}
                     >
-                      📊 Active Sessions Query
+                      🟢 เบา (Ping)
                     </button>
                     <button
                       type="button"
                       className="btn-secondary"
-                      style={{ padding: '4px 10px', fontSize: '0.75rem' }}
-                      onClick={() => applyPresetQuery('stat_db')}
+                      style={{ padding: '4px 10px', fontSize: '0.75rem', borderColor: '#fbbf24', color: '#fbbf24' }}
+                      onClick={() => applyPresetQuery('medium')}
                     >
-                      💾 DB Stats Query
+                      🟡 กลาง (Session Scan)
                     </button>
                     <button
                       type="button"
                       className="btn-secondary"
-                      style={{ padding: '4px 10px', fontSize: '0.75rem' }}
-                      onClick={() => applyPresetQuery('raw_ping')}
+                      style={{ padding: '4px 10px', fontSize: '0.75rem', borderColor: '#f97316', color: '#f97316' }}
+                      onClick={() => applyPresetQuery('heavy')}
                     >
-                      ⚡ Raw Connection Ping
+                      🟠 หนัก (DB Aggregation)
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      style={{ padding: '4px 10px', fontSize: '0.75rem', borderColor: '#ef4444', color: '#ef4444' }}
+                      onClick={() => applyPresetQuery('extreme')}
+                    >
+                      🔴 หนักสุดๆ (1K MD5 Math)
                     </button>
                   </div>
                 </div>
