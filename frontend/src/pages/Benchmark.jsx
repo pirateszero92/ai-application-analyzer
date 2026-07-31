@@ -466,7 +466,7 @@ export default function Benchmark({ token, API_BASE }) {
                 <input
                   type="range"
                   min="1"
-                  max={mode === 'http' ? "500" : "200"}
+                  max="1000"
                   value={concurrentUsers}
                   onChange={(e) => setConcurrentUsers(parseInt(e.target.value) || 1)}
                   style={{ flex: 1, accentColor: 'var(--color-primary)' }}
@@ -474,9 +474,9 @@ export default function Benchmark({ token, API_BASE }) {
                 <input
                   type="number"
                   className="form-input"
-                  style={{ width: '80px', textAlign: 'center' }}
+                  style={{ width: '90px', textAlign: 'center' }}
                   min="1"
-                  max={mode === 'http' ? "500" : "200"}
+                  max="1000"
                   value={concurrentUsers}
                   onChange={(e) => setConcurrentUsers(parseInt(e.target.value) || 1)}
                 />

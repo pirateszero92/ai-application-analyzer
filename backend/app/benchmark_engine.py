@@ -93,7 +93,7 @@ class BenchmarkEngine:
         self.name = name or "HTTP Benchmark"
         self.mode = "http"
         self.target_summary = f"{method.upper()} {target_url}"
-        self.concurrent_users = max(1, min(500, concurrent_users))
+        self.concurrent_users = max(1, min(1000, concurrent_users))
         self.duration_seconds = max(3, min(300, duration_seconds))
         self.start_time = time.time()
 
@@ -206,7 +206,7 @@ class BenchmarkEngine:
         db_label = db_conn_info.get("label", db_conn_info.get("host", "PostgreSQL"))
         cleaned_sql = sql_query.strip().replace('\n', ' ')[:100]
         self.target_summary = f"[{db_label}] {cleaned_sql}"
-        self.concurrent_users = max(1, min(200, concurrent_users))
+        self.concurrent_users = max(1, min(1000, concurrent_users))
         self.duration_seconds = max(3, min(300, duration_seconds))
         self.start_time = time.time()
 
