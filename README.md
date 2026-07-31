@@ -45,21 +45,18 @@ docker compose up --build -d
 
 ## ☸️ แนวทางการติดตั้งไปยัง Kubernetes (Talos OS + Rook-Ceph)
 
-ตัวไฟล์ Manifest สำหรับ Kubernetes ได้รับการจัดเตรียมไว้ที่ [k8s/app-deployment.yaml](file:///c:/Users/arthit.n/git/ai_analyzer/k8s/app-deployment.yaml) ซึ่งออกแบบมาเฉพาะสำหรับ **Rook-Ceph storage class** และระบบ Cluster บน **Talos OS**:
+ตัวไฟล์ Manifest สำหรับ Kubernetes ได้รับการจัดเตรียมไว้ที่ `k8s/app-deployment.yaml` ซึ่งออกแบบมาเฉพาะสำหรับ **Rook-Ceph storage class** และระบบ Cluster บน **Talos OS**:
 
 ### 1. Build and Push Docker Images
 ก่อนทำการติดตั้ง ให้ทำการ Build และ Push Docker Image ของ Backend และ Frontend ไปยัง Private Docker Registry ของคุณ:
 
 ```bash
-# Build & Push Backend
 docker build -t your-docker-registry/ai-analyzer-backend:latest ./backend
 docker push your-docker-registry/ai-analyzer-backend:latest
 
-# Build & Push Frontend
 docker build -t your-docker-registry/ai-analyzer-frontend:latest ./frontend
 docker push your-docker-registry/ai-analyzer-frontend:latest
 ```
-*(แก้ไขชื่อ Image ในไฟล์ [k8s/app-deployment.yaml](file:///c:/Users/arthit.n/git/ai_analyzer/k8s/app-deployment.yaml) ที่บรรทัด backend และ frontend ให้ถูกต้อง)*
 
 ### 2. Apply Manifests
 สั่งติดตั้งทรัพยากรทั้งหมดขึ้น Kubernetes Cluster:
@@ -71,5 +68,5 @@ kubectl apply -f k8s/app-deployment.yaml
 ### 3. รายละเอียดการตั้งค่า K8s:
 - **Persistent Volume Claim (PVC)**: ระบบจะส่งคำขอสร้าง Block Storage ขนาด 10GB (Postgres) และ 20GB (Minio) ไปยัง Rook-Ceph ด้วย Storage Class `storageClassName: rook-ceph-block` อัตโนมัติ
 - **Ingress Controller**: ใช้ Nginx Ingress Controller ในการจัดการ Routing ไปยัง Frontend และ Backend
-  - โดเมนเริ่มต้น: `ai-analyzer.local` (สามารถแก้ไขค่า host ใน Ingress section ได้)
-- **High Availability**: ตัว backend และ frontend ทำการเซ็ตอัป `replicas: 2` และระบบหลังบ้านจะคอยเช็คสิทธิ์การรันวิเคราะห์ซ้ำซ้อนผ่านตัวล็อก Redis Lock ใน Redis Service เสมอ ทำให้ไม่เกะกะการทำงานร่วมกันบน Cluster
+  - โดเมนเริ่มต้น: `ai-analyzer.local`
+- **High Availability**: ตัว backend และ frontend ทำการเซ็ตอัป `replicas: 2` และระบบหลังบ้านจะคอยเช็คสิทธิ์การรันวิเคราะห์ซ้ำซ้อนผ่านตัวล็อก Redis Lock ใน Redis Service เสมอ
