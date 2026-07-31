@@ -1,0 +1,104 @@
+version: '3.8'
+
+services:
+  # 1. PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: ai_analyzer_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-superadmin1234}
+      POSTGRES_DB: ${POSTGRES_DB:-ai_analyzer}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-admin}", "-d", "${POSTGRES_DB:-ai_analyzer}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # 2. Redis Caching & Scheduler State
+  redis:
+    image: redis:7-alpine
+    container_name: ai_analyzer_redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 3
+
+  # 3. Minio Object Storage (S3-compatible)
+  minio:
+    image: quay.io/minio/minio:latest
+    container_name: ai_analyzer_minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"      # API port
+      - "9001:9001"      # Console administration port (restrict access at firewall level)
+    command: server /data --console-address ":9001"
+
+  # 4. FastAPI Backend API & Scheduler
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ai_analyzer_backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://admin:superadmin1234@postgres:5432/ai_analyzer}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_SECURE: ${MINIO_SECURE:-False}
+      MINIO_BUCKET: ${MINIO_BUCKET:-ai-analyzer-reports}
+      SECRET_KEY: ${SECRET_KEY:-my_super_secret_devops_key}
+      ALERT_WEBHOOK_TOKEN: ${ALERT_WEBHOOK_TOKEN:-}
+    env_file:
+      - path: .env
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    extra_hosts:
+      # Allows backend container to access LM Studio/Ollama on host machine's localhost
+      - "host.docker.internal:host-gateway"
+    expose:
+      - "8000"
+
+  # 5. Frontend Web Application (Served via Nginx Proxy)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ai_analyzer_frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"          # Host port HTTP
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  minio_data:
+    driver: local
+
