@@ -41,7 +41,7 @@ class BenchmarkEngine:
         self.last_completed_report_id = None
         self.last_error = None
 
-    def get_live_status((self) -> dict:
+    def get_live_status(self) -> dict:
         """Returns live execution status snapshot for dashboard UI."""
         elapsed = time.time() - self.start_time if self.is_running else self.elapsed_seconds
         remaining = max(0, self.duration_seconds - int(elapsed)) if self.is_running else 0
