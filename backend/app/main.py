@@ -737,3 +737,125 @@ def trigger_event_ai_diagnosis(
     return event
 
 
+# ─────────────────────────────────────────────────
+# Benchmark API Endpoints
+# ─────────────────────────────────────────────────
+from .schemas import BenchmarkStartRequest, BenchmarkReportResponse
+from .benchmark_engine import benchmark_engine
+
+@app.post("/api/benchmark/start")
+def start_benchmark(
+    req: BenchmarkStartRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Starts a new asynchronous HTTP or PostgreSQL Benchmark Load/Stress Test.
+    """
+    if benchmark_engine.is_running:
+        raise HTTPException(status_code=400, detail="A benchmark test is already running. Please wait or stop it first.")
+
+    setting = db.query(Setting).filter(Setting.id == 1).first()
+
+    if req.mode == "http":
+        if not req.target_url:
+            raise HTTPException(status_code=400, detail="target_url is required for HTTP benchmark")
+        background_tasks.add_task(
+            benchmark_engine.run_http_benchmark,
+            req.name,
+            req.target_url,
+            req.http_method or "GET",
+            req.headers_json,
+            req.payload_json,
+            req.concurrent_users,
+            req.duration_seconds,
+            setting,
+            db
+        )
+    elif req.mode == "postgres":
+        if not req.sql_query:
+            raise HTTPException(status_code=400, detail="sql_query is required for PostgreSQL benchmark")
+
+        db_conns = json.loads(setting.db_connections_json) if setting and setting.db_connections_json else []
+        selected_conn = None
+        for c in db_conns:
+            if c.get("label") == req.db_label or c.get("host") == req.db_label:
+                selected_conn = c
+                break
+
+        if not selected_conn and db_conns:
+            selected_conn = db_conns[0]
+
+        if not selected_conn:
+            raise HTTPException(status_code=400, detail="No DB Connections configured in Settings")
+
+        background_tasks.add_task(
+            benchmark_engine.run_postgres_benchmark,
+            req.name,
+            selected_conn,
+            req.sql_query,
+            req.concurrent_users,
+            req.duration_seconds,
+            setting,
+            db
+        )
+    else:
+        raise HTTPException(status_code=400, detail="Invalid benchmark mode. Use 'http' or 'postgres'")
+
+    return {"status": "Benchmark test started", "mode": req.mode}
+
+
+@app.get("/api/benchmark/live")
+def get_live_benchmark_status(current_user: User = Depends(get_current_user)):
+    """Returns real-time streaming status of executing benchmark."""
+    return benchmark_engine.get_live_status()
+
+
+@app.post("/api/benchmark/stop")
+def stop_benchmark(current_user: User = Depends(get_current_user)):
+    """Stops currently executing benchmark test."""
+    benchmark_engine.stop()
+    return {"status": "Stop signal sent"}
+
+
+@app.get("/api/benchmark/reports", response_model=List[BenchmarkReportResponse])
+def get_benchmark_reports(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Lists historical benchmark reports."""
+    from .models import BenchmarkReport
+    return db.query(BenchmarkReport).order_by(BenchmarkReport.id.desc()).all()
+
+
+@app.get("/api/benchmark/reports/{report_id}", response_model=BenchmarkReportResponse)
+def get_benchmark_report_detail(
+    report_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Fetches details of a specific benchmark report."""
+    from .models import BenchmarkReport
+    report = db.query(BenchmarkReport).filter(BenchmarkReport.id == report_id).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="BenchmarkReport not found")
+    return report
+
+
+@app.delete("/api/benchmark/reports/{report_id}")
+def delete_benchmark_report(
+    report_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Deletes a benchmark report."""
+    from .models import BenchmarkReport
+    report = db.query(BenchmarkReport).filter(BenchmarkReport.id == report_id).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="BenchmarkReport not found")
+    db.delete(report)
+    db.commit()
+    return {"status": "BenchmarkReport deleted"}
+
+

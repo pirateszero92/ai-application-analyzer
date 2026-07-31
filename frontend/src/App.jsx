@@ -9,12 +9,14 @@ import {
   Lock,
   ChevronRight,
   Calendar,
-  MessageSquare
+  MessageSquare,
+  Zap
 } from 'lucide-react';
 import Dashboard from './pages/Dashboard';
 import Settings from './pages/Settings';
 import DailySummary from './pages/DailySummary';
 import AIChat from './pages/AIChat';
+import Benchmark from './pages/Benchmark';
 
 // Fallback host for API endpoints (in development, Vite proxies or links to backend port 8000)
 // In production, Nginx proxies /api/ to the backend container
@@ -399,6 +401,29 @@ export default function App() {
           </button>
 
           <button 
+            onClick={() => setActivePage('benchmark')}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '12px',
+              width: '100%',
+              padding: '14px 16px',
+              border: 'none',
+              borderRadius: '10px',
+              background: activePage === 'benchmark' ? 'rgba(6, 182, 212, 0.12)' : 'transparent',
+              color: activePage === 'benchmark' ? 'var(--color-primary)' : 'var(--text-secondary)',
+              textAlign: 'left',
+              fontSize: '0.95rem',
+              fontWeight: activePage === 'benchmark' ? 600 : 500,
+              borderLeft: activePage === 'benchmark' ? '3px solid var(--color-primary)' : '3px solid transparent'
+            }}
+          >
+            <Zap size={18} />
+            <span>Benchmark Test</span>
+            {activePage === 'benchmark' && <ChevronRight size={14} style={{ marginLeft: 'auto' }} />}
+          </button>
+
+          <button 
             onClick={() => setActivePage('settings')}
             style={{
               display: 'flex',
@@ -430,66 +455,57 @@ export default function App() {
           flexDirection: 'column',
           gap: '12px'
         }}>
-          {user && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', paddingLeft: '10px' }}>
             <div style={{
+              width: '32px',
+              height: '32px',
+              borderRadius: '50%',
+              background: 'rgba(6, 182, 212, 0.2)',
               display: 'flex',
               alignItems: 'center',
-              gap: '10px',
-              padding: '0 8px'
+              justifyContent: 'center',
+              color: 'var(--color-primary)'
             }}>
-              <div style={{
-                background: 'rgba(255, 255, 255, 0.05)',
-                width: '32px',
-                height: '32px',
-                borderRadius: '50%',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                border: '1px solid var(--glass-border)'
-              }}>
-                <User size={16} />
-              </div>
-              <div style={{ overflow: 'hidden' }}>
-                <div style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-primary)' }}>{user.username}</div>
-                <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>Administrator</div>
-              </div>
+              <User size={16} />
             </div>
-          )}
+            <div>
+              <div style={{ fontSize: '0.85rem', fontWeight: 600 }}>{user ? user.username : 'User'}</div>
+              <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>Administrator</div>
+            </div>
+          </div>
 
           <button 
             onClick={handleLogout}
+            className="btn-danger"
             style={{
+              width: '100%',
+              padding: '10px',
+              fontSize: '0.85rem',
               display: 'flex',
               alignItems: 'center',
-              gap: '10px',
-              width: '100%',
-              padding: '12px 14px',
-              border: '1px solid rgba(244, 63, 94, 0.15)',
-              borderRadius: '8px',
-              background: 'rgba(244, 63, 94, 0.03)',
-              color: 'var(--color-danger)',
-              fontWeight: 600,
-              fontSize: '0.85rem'
+              justifyContent: 'center',
+              gap: '8px'
             }}
           >
             <LogOut size={16} />
-            <span>Logout</span>
+            <span>Sign Out</span>
           </button>
         </div>
       </aside>
 
-      {/* MAIN VIEW CONTENT CONTAINER */}
+      {/* MAIN CONTENT AREA */}
       <main style={{
-        marginLeft: '260px',
         flex: 1,
+        marginLeft: '260px',
         padding: '40px',
-        minHeight: '100vh',
-        maxWidth: 'calc(100% - 260px)'
+        maxWidth: '1400px'
       }}>
         {activePage === 'dashboard' ? (
           <Dashboard token={token} API_BASE={API_BASE} />
         ) : activePage === 'daily-summary' ? (
           <DailySummary token={token} API_BASE={API_BASE} />
+        ) : activePage === 'benchmark' ? (
+          <Benchmark token={token} API_BASE={API_BASE} />
         ) : (
           <Settings token={token} API_BASE={API_BASE} />
         )}

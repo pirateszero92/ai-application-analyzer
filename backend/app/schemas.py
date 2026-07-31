@@ -159,3 +159,47 @@ class HealthEventResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+# --- Benchmark Schemas ---
+class BenchmarkStartRequest(BaseModel):
+    name: str = "Benchmark Test"
+    mode: str = "http"  # 'http' or 'postgres'
+    # HTTP params
+    target_url: Optional[str] = None
+    http_method: Optional[str] = "GET"
+    headers_json: Optional[str] = None
+    payload_json: Optional[str] = None
+    # Postgres params
+    db_label: Optional[str] = None  # WMS-DB, TMS-DB, etc.
+    sql_query: Optional[str] = None
+    # General params
+    concurrent_users: int = 10
+    duration_seconds: int = 15
+
+
+class BenchmarkReportResponse(BaseModel):
+    id: int
+    timestamp: datetime
+    name: str
+    mode: str
+    target_summary: str
+    concurrent_users: int
+    duration_seconds: int
+    total_operations: int
+    success_operations: int
+    failed_operations: int
+    ops_per_sec: float
+    avg_latency_ms: float
+    min_latency_ms: float
+    max_latency_ms: float
+    p50_ms: float
+    p90_ms: float
+    p95_ms: float
+    p99_ms: float
+    status_breakdown_json: Optional[str] = None
+    metrics_timeline_json: Optional[str] = None
+    ai_recommendation: Optional[str] = None
+
+    class Config:
+        from_attributes = True
