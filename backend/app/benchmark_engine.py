@@ -231,6 +231,7 @@ class BenchmarkEngine:
                     password=db_conn_info.get("password"),
                     connect_timeout=5
                 )
+                conn.autocommit = True
                 cur = conn.cursor()
 
                 while time.time() < end_time and not self.should_stop:
