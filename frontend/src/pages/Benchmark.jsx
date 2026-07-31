@@ -58,16 +58,16 @@ const renderMarkdown = (text) => {
 export default function Benchmark({ token, API_BASE }) {
   const [mode, setMode] = useState('http'); // 'http' or 'postgres'
   
-  // HTTP form state
-  const [name, setName] = useState('HTTP API Stress Test');
+  // Default form state
+  const [name, setName] = useState('PostgreSQL System Catalog & Ping Test');
   const [targetUrl, setTargetUrl] = useState('http://localhost:8000/api/health/live');
   const [httpMethod, setHttpMethod] = useState('GET');
   const [headersJson, setHeadersJson] = useState('{\n  "Content-Type": "application/json"\n}');
   const [payloadJson, setPayloadJson] = useState('{\n  "test": true\n}');
 
   // Postgres form state
-  const [dbLabel, setDbLabel] = useState('TMS-DB');
-  const [sqlQuery, setSqlQuery] = useState('SELECT t.id, t.status, count(d.id) FROM public.tms_logistic_task t LEFT JOIN public.tms_logistic_task_detail d ON t.id = d.task_id GROUP BY t.id, t.status ORDER BY t.id DESC LIMIT 50;');
+  const [dbLabel, setDbLabel] = useState('WMS-DB');
+  const [sqlQuery, setSqlQuery] = useState('SELECT count(*), max(pid) FROM pg_stat_activity;');
 
   // Common form state
   const [concurrentUsers, setConcurrentUsers] = useState(20);
@@ -84,7 +84,7 @@ export default function Benchmark({ token, API_BASE }) {
   const [loadingReports, setLoadingReports] = useState(false);
 
   // Settings db connections list
-  const [availableDbs, setAvailableDbs] = useState(['TMS-DB', 'WMS-DB']);
+  const [availableDbs, setAvailableDbs] = useState(['WMS-DB', 'TMS-DB']);
 
   // Fetch settings to populate available DB connections
   useEffect(() => {
@@ -223,12 +223,12 @@ export default function Benchmark({ token, API_BASE }) {
 
   // Preset shortcuts
   const applyPresetQuery = (type) => {
-    if (type === 'tms_task') {
-      setName('TMS Task & Details JOIN Load Test');
-      setSqlQuery('SELECT t.id, t.status, count(d.id) FROM public.tms_logistic_task t LEFT JOIN public.tms_logistic_task_detail d ON t.id = d.task_id GROUP BY t.id, t.status ORDER BY t.id DESC LIMIT 50;');
-    } else if (type === 'wms_staging') {
-      setName('WMS Transaction Staging Count');
-      setSqlQuery('SELECT count(*), max(id) FROM nck.wms_transaction_staging_in;');
+    if (type === 'stat_activity') {
+      setName('PostgreSQL Active Session Load Test');
+      setSqlQuery('SELECT count(*), max(pid) FROM pg_stat_activity;');
+    } else if (type === 'stat_db') {
+      setName('PostgreSQL DB Stats Benchmark');
+      setSqlQuery('SELECT datname, numbackends FROM pg_stat_database LIMIT 10;');
     } else if (type === 'raw_ping') {
       setName('PostgreSQL Raw Connection Ping');
       setSqlQuery('SELECT pg_backend_pid(), current_timestamp;');
@@ -583,17 +583,17 @@ export default function Benchmark({ token, API_BASE }) {
                       type="button"
                       className="btn-secondary"
                       style={{ padding: '4px 10px', fontSize: '0.75rem' }}
-                      onClick={() => applyPresetQuery('tms_task')}
+                      onClick={() => applyPresetQuery('stat_activity')}
                     >
-                      🚚 TMS Task JOIN
+                      📊 Active Sessions Query
                     </button>
                     <button
                       type="button"
                       className="btn-secondary"
                       style={{ padding: '4px 10px', fontSize: '0.75rem' }}
-                      onClick={() => applyPresetQuery('wms_staging')}
+                      onClick={() => applyPresetQuery('stat_db')}
                     >
-                      📦 WMS Staging Count
+                      💾 DB Stats Query
                     </button>
                     <button
                       type="button"
