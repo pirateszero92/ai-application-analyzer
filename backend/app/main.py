@@ -554,35 +554,6 @@ def get_chat_messages(
     messages = db.query(ChatMessage).order_by(ChatMessage.timestamp.asc()).all()
     return messages
 
-@app.post("/api/chat/messages", response_model=ChatMessageResponse)
-def send_chat_message(
-    chat_msg: ChatMessageCreate,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """
-    ส่งคำถามหา AI บันทึกข้อความและคำตอบลงในหน่วยความจำฐานข้อมูล
-    """
-    # 1. Fetch history BEFORE inserting user message to avoid duplication in AI payload
-    # (Limit 19 to leave room for the new user message = 20 total context messages)
-    history_records = db.query(ChatMessage).order_by(ChatMessage.timestamp.desc()).limit(19).all()
-    history_records.reverse()  # Sort chronologically
-
-    # 2. Save user message to database
-    user_message = ChatMessage(role="user", content=chat_msg.content)
-    db.add(user_message)
-    db.commit()
-    db.refresh(user_message)
-
-    # 3. Get active setting (for AI provider configs)
-    setting = db.query(Setting).filter(Setting.id == 1).first()
-    if not setting:
-        ai_reply = "ไม่พบการตั้งค่าในระบบ กรุณาตั้งค่า AI Provider ที่หน้า Settings ก่อนเริ่มใช้งาน"
-    else:
-        # 4. Build context messages (history + new user message)
-        messages_history = [{"role": r.role, "content": r.content} for r in history_records]
-        messages_history.append({"role": "user", "content": chat_msg.content})
-
 def fetch_live_system_telemetry(db: Session = None) -> str:
     """
     Fetches real-time live infrastructure telemetry from Prometheus (10.1.1.152:9090)
@@ -675,11 +646,23 @@ def send_chat_message(
     if not setting:
         ai_reply = "ไม่พบการตั้งค่าในระบบ กรุณาตั้งค่า AI Provider ที่หน้า Settings ก่อนเริ่มใช้งาน"
     else:
-        # 4. Build context messages (history + new user message)
-        messages_history = [{"role": r.role, "content": r.content} for r in history_records]
-        messages_history.append({"role": "user", "content": chat_msg.content})
+        # 5.2 Fetch live telemetry metrics & live DB connection probes
+        live_telemetry_context = fetch_live_system_telemetry(db=db)
 
-        # 5. Fetch the latest analysis report as context-aware data
+        # 4. Build context messages (history + new user message)
+        messages_history = []
+        for r in history_records:
+            content = r.content
+            # Sanitize past refusal hallucination messages from context
+            if r.role == "assistant" and ("ไม่สามารถเชื่อมต่อ" in content or "ไม่มีความสามารถในการเชื่อมต่อ" in content or "ข้อจำกัดทางเทคนิค" in content or "ไม่มีเครื่องมือในการเชื่อมต่อ" in content):
+                content = "[หมายเหตุ: ระบบเอนจินหลังบ้านได้ทำการทดสอบเชื่อมต่อจริงเรียบร้อยแล้ว]"
+            messages_history.append({"role": r.role, "content": content})
+
+        user_prompt_content = chat_msg.content
+        if any(w in user_prompt_content.lower() for w in ["เชื่อมต่อ", "connect", "tms", "wms", "db"]):
+            user_prompt_content += f"\n\n{live_telemetry_context}"
+
+        messages_history.append({"role": "user", "content": user_prompt_content})
         latest_report = db.query(Report).filter(Report.status == "success").order_by(Report.timestamp.desc()).first()
         report_context = ""
         if latest_report and latest_report.summary and latest_report.timestamp:
