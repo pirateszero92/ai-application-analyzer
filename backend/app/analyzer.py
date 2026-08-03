@@ -860,16 +860,16 @@ def fetch_direct_db_diagnostics(connections_json_str: str) -> str:
             # C. Tables with high seq scans vs index scans (CUMULATIVE counters)
             try:
                 cur.execute("""
-                    SELECT schemaname, relname, seq_scan, idx_scan, 
-                           n_dead_tup, n_live_tup,
-                           CASE WHEN (seq_scan + COALESCE(idx_scan, 0)) > 0 
-                                THEN ROUND(100.0 * seq_scan / (seq_scan + COALESCE(idx_scan, 0)), 1)
+                    SELECT t.schemaname, t.relname, t.seq_scan, t.idx_scan, 
+                           t.n_dead_tup, t.n_live_tup,
+                           CASE WHEN (t.seq_scan + COALESCE(t.idx_scan, 0)) > 0 
+                                THEN ROUND(100.0 * t.seq_scan / (t.seq_scan + COALESCE(t.idx_scan, 0)), 1)
                                 ELSE 0 END as seq_scan_pct,
                            pg_stat_get_last_analyze_time(c.oid) as last_analyze
                     FROM pg_stat_user_tables t
                     JOIN pg_class c ON c.relname = t.relname AND c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = t.schemaname)
-                    WHERE seq_scan > 100 AND (idx_scan = 0 OR seq_scan > idx_scan)
-                    ORDER BY seq_scan DESC LIMIT 5
+                    WHERE t.seq_scan > 100 AND (t.idx_scan = 0 OR t.seq_scan > t.idx_scan)
+                    ORDER BY t.seq_scan DESC LIMIT 5
                 """)
                 tables = cur.fetchall()
                 lines.append("  [Tables with High Seq Scan Ratio (⚠️ ค่า seq_scan/idx_scan เป็น CUMULATIVE COUNTER สะสมตั้งแต่ last stats reset ไม่ใช่ค่าปัจจุบัน)]")
