@@ -583,13 +583,14 @@ def send_chat_message(
         messages_history = [{"role": r.role, "content": r.content} for r in history_records]
         messages_history.append({"role": "user", "content": chat_msg.content})
 
-def fetch_live_system_telemetry() -> str:
+def fetch_live_system_telemetry(db: Session = None) -> str:
     """
     Fetches real-time live infrastructure telemetry from Prometheus (10.1.1.152:9090)
-    for pre-verification before the AI suggests solutions.
+    and probes live database connections configured in Settings.
     """
     import urllib.request
     import json
+    import psycopg2
     
     telemetry = []
     base_url = "http://10.1.1.152:9090/api/v1/query?query="
@@ -621,18 +622,28 @@ def fetch_live_system_telemetry() -> str:
     except Exception:
         pass
 
-    # 3. Check Live Active PostgreSQL Connections
-    try:
-        url = base_url + "sum(pg_stat_activity_count{state=%22active%22})"
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=2) as resp:
-            data = json.loads(resp.read().decode())
-            res = data.get('data', {}).get('result', [])
-            if res:
-                active_conn = float(res[0]['value'][1])
-                telemetry.append(f"🐘 Active DB Connections สดขณะนี้: {active_conn:.0f} active sessions")
-    except Exception:
-        pass
+    # 3. Live probe configured Database Connections
+    if db:
+        try:
+            setting = db.query(Setting).filter(Setting.id == 1).first()
+            if setting and setting.db_connections_json:
+                db_conns = json.loads(setting.db_connections_json)
+                for conn_info in db_conns:
+                    label = conn_info.get("label", conn_info.get("host"))
+                    host = conn_info.get("host")
+                    port = int(conn_info.get("port", 5432))
+                    dbname = conn_info.get("dbname")
+                    user = conn_info.get("user")
+                    password = conn_info.get("password")
+                    try:
+                        c = psycopg2.connect(host=host, port=port, dbname=dbname, user=user, password=password, connect_timeout=3)
+                        c.close()
+                        telemetry.append(f"🐘 [SUCCESS] ฐานข้อมูล {label} ({host}:{port}/{dbname}): เชื่อมต่อได้ปกติ 100%")
+                    except Exception as e:
+                        err_msg = str(e).strip().replace('\n', ' ')
+                        telemetry.append(f"🐘 [FAILED] ฐานข้อมูล {label} ({host}:{port}/{dbname}): ❌ เชื่อมต่อไม่ได้! สาเหตุ: {err_msg}")
+        except Exception as ex:
+            print(f"[!] Error probing DB connections in telemetry: {ex}")
 
     if telemetry:
         return "\n\n[ข้อมูลสถานะ Real-time สดจากระบบ ณ วินาทีนี้ที่ AI ตรวจสอบจริงล่วงหน้าก่อนให้คำแนะนำ]:\n" + "\n".join(telemetry)
@@ -717,15 +728,18 @@ def send_chat_message(
             except Exception as ex:
                 print(f"[!] Error building benchmark_context for chat: {ex}")
 
-        # 5.2 Fetch live telemetry metrics (Pre-verification loop)
-        live_telemetry_context = fetch_live_system_telemetry()
+        # 5.2 Fetch live telemetry metrics & live DB connection probes
+        live_telemetry_context = fetch_live_system_telemetry(db=db)
 
         # 6. Define System Prompt
         system_prompt = (
             "คุณคือผู้ช่วยวิศวกรระบบและผู้ดูแลระบบฐานข้อมูลอาวุโส (Senior DevOps & DBA) "
             "หน้าที่ของคุณคือช่วยเหลือตอบคำถามเชิงเทคนิคเกี่ยวกับการจูน PostgreSQL, PgBouncer, Nginx, Linux, และแอป Spring Boot "
-            "ให้คำแนะนำที่ชัดเจน ปลอดภัย และนำไปปฏิบัติจริงได้ตามสถาปัตยกรรม WMS/TMS ของโครงการ "
-            "คุณมีความสามารถรับรู้ข้อมูลผลการทดสอบประสิทธิภาพจากโมดูล Benchmark Test Suite และทำการตรวจสอบสถานะสดจาก Prometheus ก่อนตอบเสมอ"
+            "ให้คำแนะนำที่ชัดเจน ปลอดภัย และนำไปปฏิบัติจริงได้ตามสถาปัตยกรรม WMS/TMS ของโครงการ\n\n"
+            "ข้อบังคับสำคัญที่สุดเรื่องการเชื่อมต่อฐานข้อมูล:\n"
+            "- ระบบเอนจินหลังบ้านได้ทำการเชื่อมต่อทดสอบจริง (Live DB Probe) ไปยังฐานข้อมูล TMS-DB และ WMS-DB ให้คุณเรียบร้อยแล้ว\n"
+            "- ห้ามตอบปฏิเสธว่า 'ในฐานะ AI ไม่มีความสามารถในการเชื่อมต่อเข้า Server/Database โดยตรง' เด็ดขาด!\n"
+            "- จงรายงานผลการทดสอบการเชื่อมต่อจริงจากข้อมูล Telemetry ด้านล่างนี้ให้ผู้ใช้ทราบทันที หากพบว่า TMS-DB หรือ WMS-DB เชื่อมต่อไม่ได้ ให้บอกสาเหตุ (เช่น FATAL: password authentication failed บน Port 6432) และแนะนำแนวทางแก้ไข (เช่น สลับไปใช้ Port 5432 ในหน้า Settings หรือเพิ่ม user ใน userlist.txt ของ PgBouncer) อย่างสุภาพและตรงจุด"
             + report_context
             + benchmark_context
             + live_telemetry_context
