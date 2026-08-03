@@ -583,6 +583,91 @@ def send_chat_message(
         messages_history = [{"role": r.role, "content": r.content} for r in history_records]
         messages_history.append({"role": "user", "content": chat_msg.content})
 
+def fetch_live_system_telemetry() -> str:
+    """
+    Fetches real-time live infrastructure telemetry from Prometheus (10.1.1.152:9090)
+    for pre-verification before the AI suggests solutions.
+    """
+    import urllib.request
+    import json
+    
+    telemetry = []
+    base_url = "http://10.1.1.152:9090/api/v1/query?query="
+    
+    # 1. Check Container Down status
+    try:
+        url = base_url + "time()-container_last_seen{name!=%22%22}>30"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            data = json.loads(resp.read().decode())
+            down_containers = [i['metric'].get('name') for i in data.get('data', {}).get('result', []) if i['metric'].get('name')]
+            if down_containers:
+                telemetry.append(f"⚠️ พบ Container ที่ DOWN/Crashed ขณะนี้: {', '.join(down_containers[:5])}")
+            else:
+                telemetry.append("✅ สถานะ Containers ทั้งหมด: ปกติ (ไม่มี Container Down/Stale ในระบบ)")
+    except Exception:
+        pass
+
+    # 2. Check Node CPU Load
+    try:
+        url = base_url + "100-(avg(rate(node_cpu_seconds_total{mode=%22idle%22}[1m]))*100)"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            data = json.loads(resp.read().decode())
+            res = data.get('data', {}).get('result', [])
+            if res:
+                cpu_val = float(res[0]['value'][1])
+                telemetry.append(f"📊 Node CPU Usage สดขณะนี้: {cpu_val:.1f}%")
+    except Exception:
+        pass
+
+    # 3. Check Live Active PostgreSQL Connections
+    try:
+        url = base_url + "sum(pg_stat_activity_count{state=%22active%22})"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            data = json.loads(resp.read().decode())
+            res = data.get('data', {}).get('result', [])
+            if res:
+                active_conn = float(res[0]['value'][1])
+                telemetry.append(f"🐘 Active DB Connections สดขณะนี้: {active_conn:.0f} active sessions")
+    except Exception:
+        pass
+
+    if telemetry:
+        return "\n\n[ข้อมูลสถานะ Real-time สดจากระบบ ณ วินาทีนี้ที่ AI ตรวจสอบจริงล่วงหน้าก่อนให้คำแนะนำ]:\n" + "\n".join(telemetry)
+    return ""
+
+
+@app.post("/api/chat/messages", response_model=ChatMessageResponse)
+def send_chat_message(
+    chat_msg: ChatMessageCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    ส่งคำถามหา AI บันทึกข้อความและคำตอบลงในหน่วยความจำฐานข้อมูล
+    """
+    # 1. Fetch history BEFORE inserting user message to avoid duplication in AI payload
+    # (Limit 19 to leave room for the new user message = 20 total context messages)
+    history_records = db.query(ChatMessage).order_by(ChatMessage.timestamp.desc()).limit(19).all()
+    history_records.reverse()  # Sort chronologically
+
+    # 2. Save user message to database
+    user_message = ChatMessage(role="user", content=chat_msg.content)
+    db.add(user_message)
+    db.commit()
+    db.refresh(user_message)
+
+    # 3. Get active setting (for AI provider configs)
+    setting = db.query(Setting).filter(Setting.id == 1).first()
+    if not setting:
+        ai_reply = "ไม่พบการตั้งค่าในระบบ กรุณาตั้งค่า AI Provider ที่หน้า Settings ก่อนเริ่มใช้งาน"
+    else:
+        # 4. Build context messages (history + new user message)
+        messages_history = [{"role": r.role, "content": r.content} for r in history_records]
+        messages_history.append({"role": "user", "content": chat_msg.content})
+
         # 5. Fetch the latest analysis report as context-aware data
         latest_report = db.query(Report).filter(Report.status == "success").order_by(Report.timestamp.desc()).first()
         report_context = ""
@@ -632,14 +717,18 @@ def send_chat_message(
             except Exception as ex:
                 print(f"[!] Error building benchmark_context for chat: {ex}")
 
+        # 5.2 Fetch live telemetry metrics (Pre-verification loop)
+        live_telemetry_context = fetch_live_system_telemetry()
+
         # 6. Define System Prompt
         system_prompt = (
             "คุณคือผู้ช่วยวิศวกรระบบและผู้ดูแลระบบฐานข้อมูลอาวุโส (Senior DevOps & DBA) "
             "หน้าที่ของคุณคือช่วยเหลือตอบคำถามเชิงเทคนิคเกี่ยวกับการจูน PostgreSQL, PgBouncer, Nginx, Linux, และแอป Spring Boot "
             "ให้คำแนะนำที่ชัดเจน ปลอดภัย และนำไปปฏิบัติจริงได้ตามสถาปัตยกรรม WMS/TMS ของโครงการ "
-            "คุณมีความสามารถรับรู้ข้อมูลผลการทดสอบประสิทธิภาพจากโมดูล Benchmark Test Suite ล่าสุดของระบบด้วยเสมอ"
+            "คุณมีความสามารถรับรู้ข้อมูลผลการทดสอบประสิทธิภาพจากโมดูล Benchmark Test Suite และทำการตรวจสอบสถานะสดจาก Prometheus ก่อนตอบเสมอ"
             + report_context
             + benchmark_context
+            + live_telemetry_context
         )
 
         # 6. Query AI Model
