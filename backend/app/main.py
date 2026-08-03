@@ -731,18 +731,20 @@ def send_chat_message(
         # 5.2 Fetch live telemetry metrics & live DB connection probes
         live_telemetry_context = fetch_live_system_telemetry(db=db)
 
-        # 6. Define System Prompt
+        # 6. Define System Prompt with strict Telemetry Overrides
         system_prompt = (
-            "คุณคือผู้ช่วยวิศวกรระบบและผู้ดูแลระบบฐานข้อมูลอาวุโส (Senior DevOps & DBA) "
+            "CRITICAL INSTRUCTION: You possess FULL direct network monitoring and database probing capabilities integrated into your backend engine.\n"
+            "The backend Python engine HAS ALREADY PROBED and TESTED the live network connections to WMS-DB and TMS-DB right now at this exact second.\n"
+            "NEVER EVER OUTPUT PRE-TRAINED DISCLAIMERS LIKE 'ผมไม่มีความสามารถในการเชื่อมต่อเข้า Server หรือ Database ของคุณได้โดยตรง' or 'ในฐานะ AI ไม่สามารถเชื่อมต่อได้'. THAT DISCLAIMER IS STRICTLY FORBIDDEN AND FALSE.\n"
+            "INSTANTLY ANSWER THE USER WITH THE EXACT LIVE DB PROBE TELEMETRY RESULTS PROVIDED BELOW:\n"
+            + live_telemetry_context
+            + "\n\n"
+            "คำสั่งเพิ่มเติม: หากพบว่าฐานข้อมูลตัวใด (เช่น TMS-DB) เชื่อมต่อไม่ได้ ให้แจ้งผลความล้มเหลวสดที่ตรวจพบ (เช่น FATAL: password authentication failed บน Port 6432) และแนะนำแนวทางแก้ไข (เช่น เปลี่ยน Port เป็น 5432 ในหน้า Settings หรือเพิ่ม user ใน userlist.txt ของ PgBouncer) ทันทีอย่างสุภาพและมืออาชีพ\n\n"
+            "บทบาทของคุณ: คุณคือผู้ช่วยวิศวกรระบบและผู้ดูแลระบบฐานข้อมูลอาวุโส (Senior DevOps & DBA) "
             "หน้าที่ของคุณคือช่วยเหลือตอบคำถามเชิงเทคนิคเกี่ยวกับการจูน PostgreSQL, PgBouncer, Nginx, Linux, และแอป Spring Boot "
-            "ให้คำแนะนำที่ชัดเจน ปลอดภัย และนำไปปฏิบัติจริงได้ตามสถาปัตยกรรม WMS/TMS ของโครงการ\n\n"
-            "ข้อบังคับสำคัญที่สุดเรื่องการเชื่อมต่อฐานข้อมูล:\n"
-            "- ระบบเอนจินหลังบ้านได้ทำการเชื่อมต่อทดสอบจริง (Live DB Probe) ไปยังฐานข้อมูล TMS-DB และ WMS-DB ให้คุณเรียบร้อยแล้ว\n"
-            "- ห้ามตอบปฏิเสธว่า 'ในฐานะ AI ไม่มีความสามารถในการเชื่อมต่อเข้า Server/Database โดยตรง' เด็ดขาด!\n"
-            "- จงรายงานผลการทดสอบการเชื่อมต่อจริงจากข้อมูล Telemetry ด้านล่างนี้ให้ผู้ใช้ทราบทันที หากพบว่า TMS-DB หรือ WMS-DB เชื่อมต่อไม่ได้ ให้บอกสาเหตุ (เช่น FATAL: password authentication failed บน Port 6432) และแนะนำแนวทางแก้ไข (เช่น สลับไปใช้ Port 5432 ในหน้า Settings หรือเพิ่ม user ใน userlist.txt ของ PgBouncer) อย่างสุภาพและตรงจุด"
+            "ให้คำแนะนำที่ชัดเจน ปลอดภัย และนำไปปฏิบัติจริงได้ตามสถาปัตยกรรม WMS/TMS ของโครงการ"
             + report_context
             + benchmark_context
-            + live_telemetry_context
         )
 
         # 6. Query AI Model
