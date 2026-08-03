@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 
 from .database import SessionLocal, engine, Base, get_db
-from .models import User, Setting, Report, DailySummary, ChatMessage, HealthEvent
+from .models import User, Setting, Report, DailySummary, ChatMessage, HealthEvent, BenchmarkReport
 from .schemas import (
     UserLogin, Token, UserChangePassword, UserResponse,
     SettingResponse, SettingUpdate, ReportResponse, ReportDetailResponse,
@@ -612,12 +612,34 @@ def send_chat_message(
                 print(f"[!] Error building report_context for chat: {ex}")
                 report_context = f"\n\n[ข้อมูลสถานะล่าสุด]:\n{latest_report.summary}"
 
-        # 5. Define System Prompt
+        # 5.1 Fetch the latest Benchmark Report (Benchmark Test Suite)
+        latest_benchmark = db.query(BenchmarkReport).order_by(BenchmarkReport.timestamp.desc()).first()
+        benchmark_context = ""
+        if latest_benchmark:
+            try:
+                benchmark_date_str = latest_benchmark.timestamp.strftime("%d/%m/%Y %H:%M:%S") if latest_benchmark.timestamp else ""
+                benchmark_context = (
+                    f"\n\n[ข้อมูลการทดสอบประสิทธิภาพล่าสุดจากโมดูล Benchmark Test Suite (Benchmark Report #{latest_benchmark.id}) - {benchmark_date_str}]:\n"
+                    f"- ชื่อการทดสอบ: {latest_benchmark.name}\n"
+                    f"- โหมด: {latest_benchmark.mode.upper()} ({latest_benchmark.target_summary})\n"
+                    f"- Concurrent Users: {latest_benchmark.concurrent_users} users (ระยะเวลา {latest_benchmark.duration_seconds}s)\n"
+                    f"- Total Operations: {latest_benchmark.total_operations} (สำเร็จ: {latest_benchmark.success_operations}, ล้มเหลว: {latest_benchmark.failed_operations})\n"
+                    f"- Throughput: {latest_benchmark.ops_per_sec:.1f} ops/s\n"
+                    f"- Latency: Avg {latest_benchmark.avg_latency_ms:.1f}ms | p50 {latest_benchmark.p50_ms:.1f}ms | p90 {latest_benchmark.p90_ms:.1f}ms | p99 {latest_benchmark.p99_ms:.1f}ms\n"
+                )
+                if latest_benchmark.ai_recommendation:
+                    benchmark_context += f"- สรุปผล AI Recommendation ล่าสุด: {latest_benchmark.ai_recommendation[:700]}...\n"
+            except Exception as ex:
+                print(f"[!] Error building benchmark_context for chat: {ex}")
+
+        # 6. Define System Prompt
         system_prompt = (
             "คุณคือผู้ช่วยวิศวกรระบบและผู้ดูแลระบบฐานข้อมูลอาวุโส (Senior DevOps & DBA) "
             "หน้าที่ของคุณคือช่วยเหลือตอบคำถามเชิงเทคนิคเกี่ยวกับการจูน PostgreSQL, PgBouncer, Nginx, Linux, และแอป Spring Boot "
-            "ให้คำแนะนำที่ชัดเจน ปลอดภัย และนำไปปฏิบัติจริงได้ตามสถาปัตยกรรม WMS/TMS ของโครงการ"
+            "ให้คำแนะนำที่ชัดเจน ปลอดภัย และนำไปปฏิบัติจริงได้ตามสถาปัตยกรรม WMS/TMS ของโครงการ "
+            "คุณมีความสามารถรับรู้ข้อมูลผลการทดสอบประสิทธิภาพจากโมดูล Benchmark Test Suite ล่าสุดของระบบด้วยเสมอ"
             + report_context
+            + benchmark_context
         )
 
         # 6. Query AI Model
