@@ -111,7 +111,7 @@ export default function Benchmark({ token, API_BASE }) {
       })
         .then(res => res.json())
         .then(data => {
-          setLiveStatus(data);
+          setLiveStatus(prev => JSON.stringify(prev) === JSON.stringify(data) ? prev : data);
           if (data.is_running) {
             // refresh reports list when test completes
           }

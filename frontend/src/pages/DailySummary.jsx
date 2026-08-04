@@ -27,11 +27,11 @@ export default function DailySummary({ token, API_BASE }) {
 
   // Fetch the list of all available daily summaries on mount
   useEffect(() => {
-    fetchSummaryList();
+    fetchSummaryList(true);
   }, []);
 
-  const fetchSummaryList = async () => {
-    setLoadingList(true);
+  const fetchSummaryList = async (isInitial = false) => {
+    if (isInitial) setLoadingList(true);
     try {
       const res = await fetch(`${API_BASE}/api/reports/daily-summaries`, {
         headers: { 'Authorization': `Bearer ${token}` }
@@ -40,7 +40,7 @@ export default function DailySummary({ token, API_BASE }) {
         const data = await res.json();
         // Sort by date descending
         const sorted = [...data].sort((a, b) => b.date.localeCompare(a.date));
-        setSummaryList(sorted);
+        setSummaryList(prev => JSON.stringify(prev) === JSON.stringify(sorted) ? prev : sorted);
         // Auto-select the most recent
         if (sorted.length > 0 && !selectedDate) {
           selectDate(sorted[0].date);
@@ -57,7 +57,7 @@ export default function DailySummary({ token, API_BASE }) {
     setSelectedDate(date);
     setLoading(true);
     setError('');
-    setSummaryData(null);
+    // Keep previous summaryData visible during load to prevent container height collapse / layout shift
     try {
       const response = await fetch(
         `${API_BASE}/api/reports/daily-summary?date=${date}&force=${forceRegen}&generate=${shouldGenerate}`,
@@ -77,10 +77,12 @@ export default function DailySummary({ token, API_BASE }) {
       } else {
         const errData = await response.json();
         setError(errData.detail || 'เกิดข้อผิดพลาดในการดึงข้อมูลสรุปประจำวัน');
+        setSummaryData(null);
       }
     } catch (e) {
       console.error(e);
       setError('ไม่สามารถเชื่อมต่อเซิร์ฟเวอร์หลังบ้านได้');
+      setSummaryData(null);
     } finally {
       setLoading(false);
     }
@@ -137,16 +139,16 @@ export default function DailySummary({ token, API_BASE }) {
     <div className="fade-in" style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
 
       {/* Top Header */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '16px' }}>
-        <div>
-          <h2 style={{ fontSize: '2rem', marginBottom: '6px' }}>Daily AI-Ops Summary</h2>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '16px', minWidth: 0 }}>
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <h2 style={{ fontSize: '2rem', marginBottom: '6px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>Daily AI-Ops Summary</h2>
           <p style={{ color: 'var(--text-secondary)', fontSize: '0.95rem' }}>
             วิเคราะห์แนวโน้มปัญหาคอขวดและประสิทธิภาพรายวัน รวบรวมข้อมูลทุก Task เพื่อให้ข้อแนะนำเชิงนโยบาย
           </p>
         </div>
 
         {/* Date Picker + Re-analyze */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexShrink: 0 }}>
           <div className="glass-card" style={{ padding: '8px 16px', display: 'flex', alignItems: 'center', gap: '10px', border: '1px solid var(--glass-border)' }}>
             <Calendar size={16} style={{ color: 'var(--color-primary)' }} />
             <input
@@ -169,7 +171,7 @@ export default function DailySummary({ token, API_BASE }) {
       </div>
 
       {/* Main 2-column Layout */}
-      <div style={{ display: 'grid', gridTemplateColumns: '280px 1fr', gap: '24px', alignItems: 'start' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(260px, 290px) minmax(0, 1fr)', gap: '24px', alignItems: 'start' }}>
 
         {/* LEFT: Date Panel */}
         <section className="glass-card" style={{

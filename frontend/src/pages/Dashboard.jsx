@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { 
   Play, 
   Clock, 
@@ -36,7 +36,7 @@ export default function Dashboard({ token, API_BASE }) {
       });
       if (res.ok) {
         const data = await res.json();
-        setLiveHealth(data);
+        setLiveHealth(prev => JSON.stringify(prev) === JSON.stringify(data) ? prev : data);
       }
     } catch (e) {
       console.error("Failed to fetch live health:", e);
@@ -131,7 +131,7 @@ export default function Dashboard({ token, API_BASE }) {
       });
       if (response.ok) {
         const data = await response.json();
-        setReports(data);
+        setReports(prev => JSON.stringify(prev) === JSON.stringify(data) ? prev : data);
         if (selectFirst && data.length > 0) {
           fetchReportDetail(data[0].id, null, data);
         }

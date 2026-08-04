@@ -45,9 +45,13 @@ export default function AIChat({ token, API_BASE, onClose }) {
     fetchChatHistory();
   }, []);
 
+  const chatBoxRef = useRef(null);
+
   useEffect(() => {
-    // Scroll to bottom whenever messages list or loading state changes
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    // Localized scroll to bottom within chat container (prevents window scrolling)
+    if (chatBoxRef.current) {
+      chatBoxRef.current.scrollTop = chatBoxRef.current.scrollHeight;
+    }
   }, [messages, loading]);
 
   const handleSendMessage = async (e) => {
@@ -387,15 +391,17 @@ export default function AIChat({ token, API_BASE, onClose }) {
       >
         
         {/* Messages Scroll Area */}
-        <div style={{ 
-          flex: 1, 
-          overflowY: 'auto', 
-          paddingRight: '10px', 
-          display: 'flex', 
-          flexDirection: 'column', 
-          gap: '20px',
-          marginBottom: '20px'
-        }}>
+        <div 
+          ref={chatBoxRef}
+          style={{ 
+            flex: 1, 
+            overflowY: 'auto', 
+            paddingRight: '10px', 
+            display: 'flex', 
+            flexDirection: 'column', 
+            gap: '20px',
+            marginBottom: '20px'
+          }}>
           {fetching ? (
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text-muted)' }}>
               <Loader2 className="spin" size={32} style={{ animation: 'spin 2s linear infinite', marginBottom: '12px' }} />
