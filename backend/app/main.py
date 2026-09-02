@@ -910,7 +910,13 @@ def send_chat_message(
                     t_stat = f.get("target_status")
                     if detected_pid:
                         if t_stat:
-                            blocker_context_lines.append(f"- ฐานข้อมูล {db_lbl}: ✅ พบ PID {detected_pid} กำลังทำงานจริง (State: {t_stat['state']}, รันมาแล้ว: {t_stat['duration_sec']}s, Wait: {t_stat['wait_type']}/{t_stat['wait_event']}, Blocking PIDs: {t_stat['blocking_pids']}) | คำสั่ง: {t_stat['query']}")
+                            blocker_context_lines.append(
+                                f"- ฐานข้อมูล {db_lbl}: ✅ พบ PID {detected_pid} ใน pg_stat_activity\n"
+                                f"  * User: {t_stat['usename']} | Client: {t_stat['client_addr']} | App: {t_stat['application_name']}\n"
+                                f"  * State: {t_stat['state']} | Duration: {t_stat['duration_sec']}s (Xact: {t_stat['xact_dur_sec']}s, State: {t_stat['state_dur_sec']}s)\n"
+                                f"  * Wait Event: {t_stat['wait_type']}/{t_stat['wait_event']} | Blocking PIDs: {t_stat['blocking_pids']}\n"
+                                f"  * Full SQL Query Statement:\n```sql\n{t_stat['query']}\n```"
+                            )
                         else:
                             blocker_context_lines.append(f"- ฐานข้อมูล {db_lbl}: ℹ️ ไม่พบ PID {detected_pid} กำลังรันค้างอยู่ในฐานข้อมูล (คำสั่งอาจทำงานเสร็จแล้วหรือถูกปิดไปแล้ว)")
 
@@ -991,6 +997,8 @@ def send_chat_message(
             "INSTANTLY ANSWER THE USER WITH THE EXACT LIVE DB PROBE TELEMETRY RESULTS PROVIDED BELOW:\n"
             + live_telemetry_context
             + "\n\n"
+            "คำสั่งสำคัญ: หากผู้ใช้ถามถึง PID หรือคิวรีที่มีปัญหา (เช่น PID 53400 หรือปัญหา Lock/ค้าง) "
+            "คุณต้องยกข้อความคำสั่ง SQL Statement เต็มๆ ของ PID นั้นออกมาแสดงใน Code Block แบบสมบูรณ์ ภายใต้หัวข้อ '📝 SQL Statement & Query Detail (สำหรับ Dev นำไปค้นหาใน Repository)' เสมอ ห้ามละเว้นเด็ดขาด เพื่อให้ทีม Developer สามารถนำไปตรวจสอบใน Codebase หรือ Repository ได้ทันที\n\n"
             "คำสั่งเพิ่มเติม: หากพบว่าฐานข้อมูลตัวใด (เช่น TMS-DB) เชื่อมต่อไม่ได้ ให้แจ้งผลความล้มเหลวสดที่ตรวจพบ (เช่น FATAL: password authentication failed บน Port 6432) และแนะนำแนวทางแก้ไข (เช่น เปลี่ยน Port เป็น 5432 ในหน้า Settings หรือเพิ่ม user ใน userlist.txt ของ PgBouncer) ทันทีอย่างสุภาพและมืออาชีพ\n\n"
             "บทบาทของคุณ: คุณคือผู้ช่วยวิศวกรระบบและผู้ดูแลระบบฐานข้อมูลอาวุโส (Senior DevOps & DBA) "
             "หน้าที่ของคุณคือช่วยเหลือตอบคำถามเชิงเทคนิคเกี่ยวกับการจูน PostgreSQL, PgBouncer, Nginx, Linux, และแอป Spring Boot "
@@ -1450,7 +1458,7 @@ def terminate_db_pid(
 def query_live_db_blocker_info(db_conns: list, target_db_label: str = None, target_pid: int = None) -> list:
     """
     Directly connects to the target PostgreSQL database and executes the exact Blocker Investigation query.
-    Extracts blocking PIDs, their query statements, duration, lock mode, and session state.
+    Extracts blocking PIDs, their full query statements, duration, lock mode, and session state.
     """
     import psycopg2
     findings = []
@@ -1482,25 +1490,37 @@ def query_live_db_blocker_info(db_conns: list, target_db_label: str = None, targ
             conn = psycopg2.connect(host=host, port=port, dbname=dbname, user=user, password=password, connect_timeout=3)
             cur = conn.cursor()
 
-            # 1. If target_pid specified, check its exact status in pg_stat_activity
+            # 1. If target_pid specified, check its exact status in pg_stat_activity with full query text
             if target_pid:
                 cur.execute("""
-                    SELECT pid, state, wait_event_type, wait_event, pg_blocking_pids(pid) AS blocking_pids,
-                           ROUND(EXTRACT(epoch FROM (now() - query_start)))::int AS dur,
-                           SUBSTRING(query FROM 1 FOR 300) AS q
+                    SELECT pid, usename, client_addr::text, application_name, state,
+                           COALESCE(wait_event_type, 'CPU/Executing') AS wait_type,
+                           COALESCE(wait_event, 'Active') AS wait_event,
+                           pg_blocking_pids(pid) AS blocking_pids,
+                           ROUND(EXTRACT(epoch FROM (now() - query_start)))::int AS query_dur,
+                           ROUND(EXTRACT(epoch FROM (now() - xact_start)))::int AS xact_dur,
+                           ROUND(EXTRACT(epoch FROM (now() - state_change)))::int AS state_dur,
+                           query AS full_query
                     FROM pg_stat_activity
                     WHERE pid = %s
                 """, (target_pid,))
                 row = cur.fetchone()
                 if row:
+                    dur_val = row[8] if row[8] is not None else (row[9] if row[9] is not None else row[10]) or 0
                     db_finding["target_status"] = {
                         "pid": row[0],
-                        "state": row[1],
-                        "wait_type": row[2],
-                        "wait_event": row[3],
-                        "blocking_pids": [int(p) for p in (row[4] or [])],
-                        "duration_sec": row[5] or 0,
-                        "query": row[6]
+                        "usename": row[1],
+                        "client_addr": row[2] or "local",
+                        "application_name": row[3] or "unknown",
+                        "state": row[4],
+                        "wait_type": row[5],
+                        "wait_event": row[6],
+                        "blocking_pids": [int(p) for p in (row[7] or [])],
+                        "query_dur_sec": row[8] or 0,
+                        "xact_dur_sec": row[9] or 0,
+                        "state_dur_sec": row[10] or 0,
+                        "duration_sec": dur_val,
+                        "query": row[11] or "(No query text available)"
                     }
 
             # 2. Query detailed Lock Tree (pg_locks + pg_stat_activity)
@@ -1514,8 +1534,8 @@ def query_live_db_blocker_info(db_conns: list, target_db_label: str = None, targ
                     ROUND(EXTRACT(epoch FROM (now() - blocking_activity.state_change)))::int AS blocking_state_dur_s,
                     blocking_locks.mode AS lock_mode,
                     blocking_locks.locktype AS lock_type,
-                    SUBSTRING(blocked_activity.query FROM 1 FOR 250) AS blocked_statement,
-                    SUBSTRING(blocking_activity.query FROM 1 FOR 250) AS blocking_statement
+                    blocked_activity.query AS blocked_statement,
+                    blocking_activity.query AS blocking_statement
                 FROM pg_catalog.pg_locks blocked_locks
                 JOIN pg_catalog.pg_stat_activity blocked_activity ON blocked_locks.pid = blocked_activity.pid
                 JOIN pg_catalog.pg_locks blocking_locks 
@@ -1573,7 +1593,7 @@ def ai_troubleshoot_realtime(
 ):
     """
     Instant AI Root Cause Diagnosis & Actionable Remediation for an active Lock or Slow Query.
-    Executes live database blocker investigation query first, then instructs AI with exact culprit PIDs.
+    Executes live database blocker investigation query first, then instructs AI with exact culprit PIDs and Full SQL.
     """
     setting = db.query(Setting).filter(Setting.id == 1).first()
     if not setting:
@@ -1583,32 +1603,40 @@ def ai_troubleshoot_realtime(
 
     # 1. Execute live blocker query on target database
     live_findings = []
+    target_full_query = req.query or ""
     if setting.db_connections_json:
         try:
             db_conns = json.loads(setting.db_connections_json)
             live_findings = query_live_db_blocker_info(db_conns, target_db_label=req.db_label, target_pid=req.pid)
+            # If target query was empty, grab the full query from live status
+            for f in live_findings:
+                if f.get("target_status") and f["target_status"].get("query"):
+                    target_full_query = f["target_status"]["query"]
+                    break
         except Exception as ex:
             print(f"[!] Error querying live blocker info: {ex}")
 
     system_prompt = (
         "คุณคือ Senior Database Administrator (DBA) และ PostgreSQL Troubleshooting Expert "
         "หน้าที่ของคุณคือรับข้อมูลคิวรีที่กำลังค้าง, คิวรีที่ติด Lock, หรือ Blocker Session ณ วินาทีนี้ "
-        "และให้คำวินิจฉัย Root Cause พร้อมระบุตัวการ Blocking PID ที่ตรวจสอบพบจริงสดๆ และให้คำสั่ง SQL สำหรับปลดล็อคและแก้ไขทันที\n\n"
+        "และให้คำวินิจฉัย Root Cause พร้อมระบุตัวการ Blocking PID และแสดง Full SQL Statement เพื่อให้ Dev นำไปแก้โค้ดได้ทันที\n\n"
         "โครงสร้างคำตอบต้องมีหัวข้อดังนี้:\n"
-        "1. 🚨 **Root Cause Diagnosis**: สรุปสาเหตุเชิงลึกว่าทำไมคิวรีถึงช้า หรือ ทำไมถึงเกิด Lock Contention\n"
-        "2. 🔍 **Step 1: ผลการตรวจสอบ Blocker สด (Live Blocker Discovery)**: สรุปว่าพบ Blocking PID ตัวการ ID ไหนบ้าง, User อะไร, State อะไร, ถือ Lock แบบไหน และรันคำสั่งอะไรอยู่ (หากไม่พบ Blocker ให้ระบุชัดเจนว่าไม่พบ Session อื่นขัดขวาง)\n"
-        "3. ⚡ **Step 2: การปลดล็อคทันที (Immediate Mitigation Actions)**:\n"
+        "1. 📝 **SQL Statement & Query Detail (สำหรับ Dev นำไปค้นหาใน Repository)**:\n"
+        "   - คุณต้องแสดงข้อความ SQL Statement เต็มๆ ที่ Session PID นี้กำลังรัน หรือรันค้างไว้ล่าสุด มาแสดงใน Code Block แบบสมบูรณ์ เพื่อให้ทีม Developer สามารถ Copy ไปค้นหาจุดที่มีปัญหาในโปรเจกต์/ซอร์สโค้ดได้ทันที\n"
+        "2. 🚨 **Root Cause Diagnosis**: สรุปสาเหตุเชิงลึกว่าทำไมคิวรีนี้ถึงช้า หรือ ทำไมถึงเกิด Lock / Idle in transaction\n"
+        "3. 🔍 **Step 1: ผลการตรวจสอบ Blocker สด (Live Blocker Discovery)**: สรุปว่าพบ Blocking PID ตัวการ ID ไหนบ้าง, User อะไร, State อะไร, ถือ Lock แบบไหน (หากไม่พบ ให้ระบุชัดเจนว่าไม่พบ Session อื่นขัดขวาง)\n"
+        "4. ⚡ **Step 2: การปลดล็อคทันที (Immediate Mitigation Actions)**:\n"
         "   - หากพบ Blocker ให้ระบุคำสั่ง SQL เพื่อ Kill หรือ Cancel ตัวการที่เป็นต้นเหตุ (Blocker PID) โดยใส่เลข PID จริงในคำสั่ง เช่น `SELECT pg_cancel_backend(BLOCKER_PID);` หรือ `SELECT pg_terminate_backend(BLOCKER_PID);`\n"
         "   - หากไม่พบ Blocker แต่ Target PID ค้าง ให้ระบุคำสั่ง Kill Target PID โดยตรง เช่น `SELECT pg_terminate_backend(TARGET_PID);`\n"
-        "4. 🛠️ **Step 3: การแก้ไขที่ต้นเหตุระยะยาว (Permanent Root Cause Solution)**: แนะนำ Index, การจูนพารามิเตอร์ (เช่น `idle_in_transaction_session_timeout = '5min'`, `lock_timeout`), หรือการปรับแก้โค้ด Application / ORM / Spring Boot Transaction Scope\n"
+        "5. 🛠️ **Step 3: การแก้ไขที่ต้นเหตุระยะยาว (Permanent Root Cause Solution)**: แนะนำ Index, การจูนพารามิเตอร์ (เช่น `idle_in_transaction_session_timeout = '5min'`, `lock_timeout`), หรือการปรับแก้โค้ด Application / ORM / Spring Boot Transaction Scope\n"
         "ห้ามใช้ HTML Tags ให้ใช้ Markdown ล้วน"
     )
 
     context_lines = [f"ฐานข้อมูลเป้าหมาย: {req.db_label}"]
     if req.pid:
         context_lines.append(f"Target PID ที่ส่งมาวิเคราะห์: {req.pid}")
-    if req.query:
-        context_lines.append(f"SQL Statement ของ Target: {req.query}")
+    if target_full_query:
+        context_lines.append(f"SQL Statement ของ Target (Full Query):\n```sql\n{target_full_query}\n```")
     if req.lock_info:
         context_lines.append(f"Lock Context Info: {json.dumps(req.lock_info, ensure_ascii=False)}")
 
@@ -1624,7 +1652,13 @@ def ai_troubleshoot_realtime(
             t_stat = f.get("target_status")
             if req.pid:
                 if t_stat:
-                    context_lines.append(f"- ฐานข้อมูล {db_lbl}: ✅ พบ PID {req.pid} ใน pg_stat_activity (State: {t_stat['state']}, รันมาแล้ว: {t_stat['duration_sec']}s, Wait: {t_stat['wait_type']}/{t_stat['wait_event']}, Blocking PIDs: {t_stat['blocking_pids']})")
+                    context_lines.append(
+                        f"- ฐานข้อมูล {db_lbl}: ✅ พบ PID {req.pid} ใน pg_stat_activity\n"
+                        f"  * User: {t_stat['usename']} | Client: {t_stat['client_addr']} | App: {t_stat['application_name']}\n"
+                        f"  * State: {t_stat['state']} | รันมาแล้ว: {t_stat['duration_sec']}s (Xact: {t_stat['xact_dur_sec']}s, State: {t_stat['state_dur_sec']}s)\n"
+                        f"  * Wait Event: {t_stat['wait_type']}/{t_stat['wait_event']} | Blocking PIDs: {t_stat['blocking_pids']}\n"
+                        f"  * Full Query: {t_stat['query']}"
+                    )
                 else:
                     context_lines.append(f"- ฐานข้อมูล {db_lbl}: ℹ️ ไม่พบ PID {req.pid} ใน pg_stat_activity (อาจทำงานเสร็จแล้วหรือหลุดไปแล้ว)")
 
