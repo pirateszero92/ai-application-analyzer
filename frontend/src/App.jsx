@@ -17,6 +17,7 @@ import Settings from './pages/Settings';
 import DailySummary from './pages/DailySummary';
 import AIChat from './pages/AIChat';
 import Benchmark from './pages/Benchmark';
+import RealtimeDBMonitor from './pages/RealtimeDBMonitor';
 
 // Fallback host for API endpoints (in development, Vite proxies or links to backend port 8000)
 // In production, Nginx proxies /api/ to the backend container
@@ -377,6 +378,37 @@ export default function App() {
           </button>
 
           <button 
+            onClick={() => setActivePage('realtime-db')}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '12px',
+              width: '100%',
+              padding: '14px 16px',
+              border: 'none',
+              borderRadius: '10px',
+              background: activePage === 'realtime-db' ? 'rgba(6, 182, 212, 0.12)' : 'transparent',
+              color: activePage === 'realtime-db' ? 'var(--color-primary)' : 'var(--text-secondary)',
+              textAlign: 'left',
+              fontSize: '0.95rem',
+              fontWeight: activePage === 'realtime-db' ? 600 : 500,
+              borderLeft: activePage === 'realtime-db' ? '3px solid var(--color-primary)' : '3px solid transparent'
+            }}
+          >
+            <Zap size={18} style={{ color: activePage === 'realtime-db' ? 'var(--color-primary)' : '#38bdf8' }} />
+            <span>Real-time DB</span>
+            <span style={{ 
+              background: 'rgba(16, 185, 129, 0.2)', 
+              color: '#34d399', 
+              fontSize: '0.65rem', 
+              fontWeight: 700, 
+              padding: '2px 6px', 
+              borderRadius: '10px',
+              marginLeft: 'auto'
+            }}>LIVE</span>
+          </button>
+
+          <button 
             onClick={() => setActivePage('daily-summary')}
             style={{
               display: 'flex',
@@ -501,6 +533,8 @@ export default function App() {
       }}>
         {activePage === 'dashboard' ? (
           <Dashboard token={token} API_BASE={API_BASE} />
+        ) : activePage === 'realtime-db' ? (
+          <RealtimeDBMonitor token={token} API_BASE={API_BASE} />
         ) : activePage === 'daily-summary' ? (
           <DailySummary token={token} API_BASE={API_BASE} />
         ) : activePage === 'benchmark' ? (

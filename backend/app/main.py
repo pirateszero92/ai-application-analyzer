@@ -1,13 +1,16 @@
 import os
 import threading
 import json
+import asyncio
 from datetime import datetime
-from fastapi import FastAPI, Depends, HTTPException, Header, status, BackgroundTasks
+from pydantic import BaseModel
+from fastapi import FastAPI, Depends, HTTPException, Header, status, BackgroundTasks, Query
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import and_
 from sqlalchemy.orm import Session
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 from .database import SessionLocal, engine, Base, get_db
 from .models import User, Setting, Report, DailySummary, ChatMessage, HealthEvent, BenchmarkReport
@@ -878,6 +881,389 @@ def trigger_event_ai_diagnosis(
     db.commit()
     db.refresh(event)
     return event
+
+
+class TerminatePidRequest(BaseModel):
+    db_label: str
+    pid: int
+    force: bool = False  # True: pg_terminate_backend (kill), False: pg_cancel_backend (cancel query)
+
+
+class LiveAITroubleshootRequest(BaseModel):
+    db_label: str
+    pid: Optional[int] = None
+    query: Optional[str] = None
+    lock_info: Optional[Dict[str, Any]] = None
+
+
+def collect_full_realtime_db_snapshot(db: Session):
+    """
+    Collects a rich real-time diagnostic snapshot across all PostgreSQL databases:
+    - Lock tree & blocker correlation graph
+    - Active & running slow queries with wait events
+    - Connection state breakdown (active, idle, idle in transaction)
+    - PgBouncer client waiting queues and active connections
+    - Spring Boot HikariCP pool and JVM metrics
+    """
+    import psycopg2
+    setting = db.query(Setting).filter(Setting.id == 1).first()
+    if not setting or not setting.db_connections_json:
+        return {"error": "No database connections configured", "databases": []}
+
+    try:
+        db_conns = json.loads(setting.db_connections_json)
+    except Exception:
+        db_conns = []
+
+    results = []
+    total_active = 0
+    total_locks = 0
+
+    for conn_info in db_conns:
+        label = conn_info.get("label", conn_info.get("host", "DB"))
+        host = conn_info.get("host")
+        port = int(conn_info.get("port", 5432))
+        dbname = conn_info.get("dbname")
+        user = conn_info.get("user")
+        password = conn_info.get("password")
+
+        if not all([host, dbname, user, password]):
+            continue
+
+        db_entry = {
+            "label": label,
+            "host": host,
+            "port": port,
+            "dbname": dbname,
+            "connected": False,
+            "error": None,
+            "conn_active": 0,
+            "conn_idle": 0,
+            "conn_idle_in_tx": 0,
+            "conn_max": 0,
+            "conn_pct": 0.0,
+            "active_queries": [],
+            "lock_tree": [],
+            "wait_events": [],
+            "disk_io_waits": 0
+        }
+
+        conn = None
+        try:
+            conn = psycopg2.connect(
+                host=host, port=port, dbname=dbname,
+                user=user, password=password, connect_timeout=3
+            )
+            cur = conn.cursor()
+            db_entry["connected"] = True
+
+            # 1. Connection states breakdown
+            try:
+                cur.execute("""
+                    SELECT state, count(*) 
+                    FROM pg_stat_activity 
+                    WHERE pid != pg_backend_pid()
+                    GROUP BY state
+                """)
+                for st, cnt in cur.fetchall():
+                    if st == 'active':
+                        db_entry["conn_active"] = cnt
+                    elif st == 'idle':
+                        db_entry["conn_idle"] = cnt
+                    elif st == 'idle in transaction':
+                        db_entry["conn_idle_in_tx"] = cnt
+            except Exception:
+                conn.rollback()
+
+            try:
+                cur.execute("SHOW max_connections")
+                db_entry["conn_max"] = int(cur.fetchone()[0] or 100)
+                db_entry["conn_pct"] = round((db_entry["conn_active"] / db_entry["conn_max"] * 100) if db_entry["conn_max"] > 0 else 0.0, 1)
+                total_active += db_entry["conn_active"]
+            except Exception:
+                conn.rollback()
+
+            # 2. Lock Tree / Blocking Sessions Graph (Deadlocks & Lock Contention)
+            try:
+                cur.execute("""
+                    SELECT
+                        blocked_locks.pid AS blocked_pid,
+                        blocked_activity.usename AS blocked_user,
+                        blocked_activity.client_addr::text AS blocked_client,
+                        ROUND(EXTRACT(epoch FROM (now() - blocked_activity.query_start)))::int AS blocked_duration_sec,
+                        SUBSTRING(blocked_activity.query FROM 1 FOR 300) AS blocked_statement,
+                        blocked_activity.state AS blocked_state,
+                        COALESCE(blocked_activity.wait_event_type, 'Lock') AS blocked_wait_type,
+                        COALESCE(blocked_activity.wait_event, 'transactionid') AS blocked_wait_event,
+                        blocking_locks.pid AS blocking_pid,
+                        blocking_activity.usename AS blocking_user,
+                        blocking_activity.client_addr::text AS blocking_client,
+                        ROUND(EXTRACT(epoch FROM (now() - blocking_activity.query_start)))::int AS blocking_duration_sec,
+                        SUBSTRING(blocking_activity.query FROM 1 FOR 300) AS blocking_statement,
+                        blocking_activity.state AS blocking_state,
+                        blocking_locks.mode AS lock_mode,
+                        blocking_locks.locktype AS lock_type
+                    FROM pg_catalog.pg_locks blocked_locks
+                    JOIN pg_catalog.pg_stat_activity blocked_activity ON blocked_activity.pid = blocked_locks.pid
+                    JOIN pg_catalog.pg_locks blocking_locks 
+                        ON blocking_locks.locktype = blocked_locks.locktype
+                        AND blocking_locks.database IS NOT DISTINCT FROM blocked_locks.database
+                        AND blocking_locks.relation IS NOT DISTINCT FROM blocked_locks.relation
+                        AND blocking_locks.page IS NOT DISTINCT FROM blocked_locks.page
+                        AND blocking_locks.tuple IS NOT DISTINCT FROM blocked_locks.tuple
+                        AND blocking_locks.virtualxid IS NOT DISTINCT FROM blocked_locks.virtualxid
+                        AND blocking_locks.transactionid IS NOT DISTINCT FROM blocked_locks.transactionid
+                        AND blocking_locks.classid IS NOT DISTINCT FROM blocked_locks.classid
+                        AND blocking_locks.objid IS NOT DISTINCT FROM blocked_locks.objid
+                        AND blocking_locks.objsubid IS NOT DISTINCT FROM blocked_locks.objsubid
+                        AND blocking_locks.pid != blocked_locks.pid
+                    JOIN pg_catalog.pg_stat_activity blocking_activity ON blocking_activity.pid = blocking_locks.pid
+                    WHERE NOT blocked_locks.granted
+                    ORDER BY blocked_duration_sec DESC LIMIT 20;
+                """)
+                for r in cur.fetchall():
+                    db_entry["lock_tree"].append({
+                        "blocked_pid": r[0],
+                        "blocked_user": r[1],
+                        "blocked_client": r[2],
+                        "blocked_duration_sec": r[3] or 0,
+                        "blocked_statement": r[4],
+                        "blocked_state": r[5],
+                        "blocked_wait_type": r[6],
+                        "blocked_wait_event": r[7],
+                        "blocking_pid": r[8],
+                        "blocking_user": r[9],
+                        "blocking_client": r[10],
+                        "blocking_duration_sec": r[11] or 0,
+                        "blocking_statement": r[12],
+                        "blocking_state": r[13],
+                        "lock_mode": r[14],
+                        "lock_type": r[15]
+                    })
+                total_locks += len(db_entry["lock_tree"])
+            except Exception:
+                conn.rollback()
+
+            # 3. Active Queries
+            try:
+                cur.execute("""
+                    SELECT pid, usename, client_addr::text, state,
+                           COALESCE(wait_event_type, 'Executing/CPU') AS wait_type,
+                           COALESCE(wait_event, 'Active') AS wait_ev,
+                           ROUND(EXTRACT(epoch FROM (now() - query_start)))::int AS dur,
+                           ROUND(EXTRACT(epoch FROM (now() - state_change)))::int AS state_dur,
+                           SUBSTRING(query FROM 1 FOR 400) AS q_text,
+                           pg_blocking_pids(pid) AS blocking_pids
+                    FROM pg_stat_activity
+                    WHERE state != 'idle' 
+                      AND pid != pg_backend_pid()
+                      AND backend_type != 'walsender'
+                      AND query NOT ILIKE 'START_REPLICATION%'
+                      AND query NOT ILIKE 'autovacuum:%'
+                      AND query_start IS NOT NULL
+                    ORDER BY dur DESC LIMIT 25
+                """)
+                for row in cur.fetchall():
+                    pid, usename, client, st, wtype, wev, dur, sdur, qtxt, blocking = row
+                    db_entry["active_queries"].append({
+                        "pid": pid,
+                        "usename": usename,
+                        "client_addr": client,
+                        "state": st,
+                        "wait_event_type": wtype,
+                        "wait_event": wev,
+                        "duration_sec": dur or 0,
+                        "state_duration_sec": sdur or 0,
+                        "query": qtxt,
+                        "blocking_pids": [int(p) for p in (blocking or [])]
+                    })
+            except Exception:
+                conn.rollback()
+
+            # 4. Wait Event Breakdown
+            try:
+                cur.execute("""
+                    SELECT COALESCE(wait_event_type, 'CPU / Executing') AS wtype,
+                           COALESCE(wait_event, 'Active') AS wev,
+                           count(*) AS cnt
+                    FROM pg_stat_activity
+                    WHERE state != 'idle' AND pid != pg_backend_pid() AND backend_type != 'walsender'
+                    GROUP BY wait_event_type, wait_event
+                    ORDER BY count(*) DESC LIMIT 8
+                """)
+                for wrow in cur.fetchall():
+                    wt, we, wc = wrow
+                    db_entry["wait_events"].append({"wait_type": wt, "wait_event": we, "count": wc})
+                    if wt == 'IO':
+                        db_entry["disk_io_waits"] += wc
+            except Exception:
+                conn.rollback()
+
+            cur.close()
+            conn.close()
+        except Exception as e:
+            db_entry["error"] = str(e).strip().replace('\n', ' ')
+            if conn:
+                try: conn.close()
+                except: pass
+
+        results.append(db_entry)
+
+    from .proactive_monitor import _fetch_pgbouncer_metrics, _fetch_container_metrics, _fetch_springboot_actuator_metrics
+    projects = json.loads(setting.loki_projects) if setting.loki_projects else []
+    pgb_metrics = _fetch_pgbouncer_metrics(setting.prometheus_ip, setting.prometheus_port, projects)
+    container_metrics = _fetch_container_metrics(setting.prometheus_ip, setting.prometheus_port, projects)
+    springboot_metrics = _fetch_springboot_actuator_metrics(setting.prometheus_ip, setting.prometheus_port, projects)
+
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "total_active_connections": total_active,
+        "total_lock_conflicts": total_locks,
+        "databases": results,
+        "pgbouncer": pgb_metrics,
+        "containers": container_metrics,
+        "springboot": springboot_metrics
+    }
+
+
+@app.get("/api/db/snapshot-realtime")
+def get_db_snapshot_realtime(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Returns an instant comprehensive snapshot of all PostgreSQL databases:
+    Lock graph, active slow queries, wait events, PgBouncer, and HikariCP queues.
+    """
+    return collect_full_realtime_db_snapshot(db)
+
+
+@app.get("/api/db/stream-realtime")
+async def stream_db_realtime(
+    token: Optional[str] = Query(None)
+):
+    """
+    Server-Sent Events (SSE) stream pushing live PostgreSQL status,
+    active queries, and lock tree updates every 2 seconds.
+    """
+    # Verify token
+    if token:
+        try:
+            from jose import jwt
+            from .auth import SECRET_KEY, ALGORITHM
+            jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        except Exception:
+            raise HTTPException(status_code=401, detail="Invalid token")
+
+    async def event_generator():
+        while True:
+            db = SessionLocal()
+            try:
+                data = collect_full_realtime_db_snapshot(db)
+                yield f"data: {json.dumps(data)}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            finally:
+                db.close()
+            await asyncio.sleep(2)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@app.post("/api/db/terminate-pid")
+def terminate_db_pid(
+    req: TerminatePidRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Safely terminates or cancels a blocking / long-running query PID on the selected database.
+    """
+    import psycopg2
+    setting = db.query(Setting).filter(Setting.id == 1).first()
+    if not setting or not setting.db_connections_json:
+        raise HTTPException(status_code=400, detail="No database connections configured")
+
+    db_conns = json.loads(setting.db_connections_json)
+    target_conn = next((c for c in db_conns if c.get("label") == req.db_label or c.get("host") == req.db_label), None)
+    if not target_conn:
+        raise HTTPException(status_code=404, detail=f"Database '{req.db_label}' not found")
+
+    host = target_conn.get("host")
+    port = int(target_conn.get("port", 5432))
+    dbname = target_conn.get("dbname")
+    user = target_conn.get("user")
+    password = target_conn.get("password")
+
+    func_name = "pg_terminate_backend" if req.force else "pg_cancel_backend"
+    try:
+        conn = psycopg2.connect(host=host, port=port, dbname=dbname, user=user, password=password, connect_timeout=4)
+        cur = conn.cursor()
+        cur.execute(f"SELECT {func_name}(%s)", (req.pid,))
+        result = cur.fetchone()[0]
+        cur.close()
+        conn.close()
+        action_name = "Terminated (Killed)" if req.force else "Cancelled"
+        return {
+            "status": "success" if result else "not_found",
+            "message": f"Successfully {action_name} PID {req.pid} on {req.db_label}",
+            "pid": req.pid,
+            "db_label": req.db_label
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to execute {func_name}({req.pid}): {str(e)}")
+
+
+@app.post("/api/db/ai-troubleshoot-realtime")
+def ai_troubleshoot_realtime(
+    req: LiveAITroubleshootRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Instant AI Root Cause Diagnosis & Actionable Remediation for an active Lock or Slow Query.
+    """
+    setting = db.query(Setting).filter(Setting.id == 1).first()
+    if not setting:
+        raise HTTPException(status_code=400, detail="Settings not configured")
+
+    from .analyzer import call_chat_ai
+
+    system_prompt = (
+        "คุณคือ Senior Database Administrator (DBA) และ PostgreSQL Troubleshooting Expert "
+        "หน้าที่ของคุณคือรับข้อมูลคิวรีที่กำลังค้าง, คิวรีที่ติด Lock, หรือ Blocker Session ณ วินาทีนี้ "
+        "และให้คำวินิจฉัย Root Cause พร้อมคำสั่ง SQL / Linux Bash สำหรับปลดล็อคและแก้ไขทันทีใน 1-3 นาที\n\n"
+        "โครงสร้างคำตอบ:\n"
+        "1. 🚨 **Root Cause Diagnosis**: ทำไมคิวรีนี้ถึงช้า หรือ ทำไมถึงเกิด Lock Contention\n"
+        "2. ⚡ **Immediate Mitigation**: คำสั่ง SQL/Bash ที่ต้องทำทันที (เช่น สั่ง Kill PID หรือ Cancel Transaction)\n"
+        "3. 🛠️ **Permanent Solution**: แนะนำ Index, Tuning Parameters (เช่น idle_in_transaction_session_timeout, lock_timeout), หรือการแก้โค้ด ORM/Spring Boot\n"
+        "ห้ามใช้ HTML Tags ให้ใช้ Markdown ล้วน"
+    )
+
+    context_lines = [f"ฐานข้อมูลเป้าหมาย: {req.db_label}"]
+    if req.pid:
+        context_lines.append(f"Target PID: {req.pid}")
+    if req.query:
+        context_lines.append(f"SQL Statement: {req.query}")
+    if req.lock_info:
+        context_lines.append(f"Lock Information: {json.dumps(req.lock_info, ensure_ascii=False)}")
+
+    user_prompt = "กรุณาวิเคราะห์ปัญหาและแนะนำวิธีแก้ไข Real-time สำหรับสถานการณ์ต่อไปนี้:\n\n" + "\n".join(context_lines)
+
+    ai_reply = call_chat_ai(
+        provider=setting.ai_provider,
+        host_url=setting.ai_host_url,
+        model_name=setting.ai_model_name,
+        messages_history=[{"role": "user", "content": user_prompt}],
+        system_prompt=system_prompt
+    )
+
+    return {
+        "status": "success",
+        "db_label": req.db_label,
+        "pid": req.pid,
+        "ai_recommendation": ai_reply
+    }
 
 
 @app.get("/api/db/diagnose-realtime")
