@@ -2,6 +2,7 @@ import os
 import threading
 import json
 import asyncio
+import re
 from datetime import datetime
 from pydantic import BaseModel
 from fastapi import FastAPI, Depends, HTTPException, Header, status, BackgroundTasks, Query
@@ -882,6 +883,54 @@ def send_chat_message(
         if any(w in user_prompt_content.lower() for w in ["เชื่อมต่อ", "connect", "tms", "wms", "db"]):
             user_prompt_content += f"\n\n{live_telemetry_context}"
 
+        # Automatic live blocker investigation query if PID or lock mentioned
+        pid_match = re.search(r'(?:pid|PID)\s*[:=]?\s*(\d+)', user_prompt_content)
+        detected_pid = int(pid_match.group(1)) if pid_match else None
+        
+        if detected_pid or any(w in user_prompt_content.lower() for w in ["lock", "blocker", "ค้าง", "ตัวการ", "blocking", "kill"]):
+            try:
+                db_conns = json.loads(setting.db_connections_json) if setting.db_connections_json else []
+                target_label = None
+                for c in db_conns:
+                    lbl = c.get("label", "").lower()
+                    dbn = c.get("dbname", "").lower()
+                    if (lbl and lbl in user_prompt_content.lower()) or (dbn and dbn in user_prompt_content.lower()):
+                        target_label = c.get("label")
+                        break
+                
+                blocker_findings = query_live_db_blocker_info(db_conns, target_db_label=target_label, target_pid=detected_pid)
+                
+                blocker_context_lines = []
+                for f in blocker_findings:
+                    db_lbl = f["db_label"]
+                    if f.get("error"):
+                        blocker_context_lines.append(f"- ฐานข้อมูล {db_lbl}: ❌ เชื่อมต่อไม่ได้ ({f['error']})")
+                        continue
+                    
+                    t_stat = f.get("target_status")
+                    if detected_pid:
+                        if t_stat:
+                            blocker_context_lines.append(f"- ฐานข้อมูล {db_lbl}: ✅ พบ PID {detected_pid} กำลังทำงานจริง (State: {t_stat['state']}, รันมาแล้ว: {t_stat['duration_sec']}s, Wait: {t_stat['wait_type']}/{t_stat['wait_event']}, Blocking PIDs: {t_stat['blocking_pids']}) | คำสั่ง: {t_stat['query']}")
+                        else:
+                            blocker_context_lines.append(f"- ฐานข้อมูล {db_lbl}: ℹ️ ไม่พบ PID {detected_pid} กำลังรันค้างอยู่ในฐานข้อมูล (คำสั่งอาจทำงานเสร็จแล้วหรือถูกปิดไปแล้ว)")
+
+                    blockers = f.get("blockers_found", [])
+                    if blockers:
+                        blocker_context_lines.append(f"- 🚨 ตรวจพบ Lock Contention บน {db_lbl} จำนวน {len(blockers)} รายการ:")
+                        for b in blockers:
+                            blocker_context_lines.append(
+                                f"  * ⛔ Blocker PID = {b['blocking_pid']} (User: {b['blocking_user']}, State: {b['blocking_state']}, Duration: {b['blocking_dur_s']}s, Lock: {b['lock_mode']}/{b['lock_type']}) กำลัง Block PID {b['blocked_pid']}\n"
+                                f"    - Blocker Statement: {b['blocking_statement']}\n"
+                                f"    - Blocked Statement: {b['blocked_statement']}"
+                            )
+                    elif not t_stat and not detected_pid:
+                        blocker_context_lines.append(f"- ฐานข้อมูล {db_lbl}: ✅ ตรวจสอบ pg_locks สดแล้ว ไม่พบ Session อื่นที่กำลังถือ Lock บล็อกอยู่ (0 Blockers)")
+
+                if blocker_context_lines:
+                    user_prompt_content += "\n\n[ผลการเข้า Query ตรวจสอบ pg_locks และ pg_stat_activity สดจากฐานข้อมูล ณ วินาทีนี้โดยระบบหลังบ้าน]:\n" + "\n".join(blocker_context_lines)
+            except Exception as ex:
+                print(f"[!] Error executing live blocker probe for chat: {ex}")
+
         messages_history.append({"role": "user", "content": user_prompt_content})
         latest_report = db.query(Report).filter(Report.status == "success").order_by(Report.timestamp.desc()).first()
         report_context = ""
@@ -1398,6 +1447,124 @@ def terminate_db_pid(
         raise HTTPException(status_code=500, detail=f"Failed to execute {func_name}({req.pid}): {str(e)}")
 
 
+def query_live_db_blocker_info(db_conns: list, target_db_label: str = None, target_pid: int = None) -> list:
+    """
+    Directly connects to the target PostgreSQL database and executes the exact Blocker Investigation query.
+    Extracts blocking PIDs, their query statements, duration, lock mode, and session state.
+    """
+    import psycopg2
+    findings = []
+    
+    for conn_info in db_conns:
+        label = conn_info.get("label", conn_info.get("host", "DB"))
+        if target_db_label and target_db_label != "ALL" and target_db_label.lower() not in label.lower() and label.lower() not in target_db_label.lower():
+            continue
+
+        host = conn_info.get("host")
+        port = int(conn_info.get("port", 5432))
+        dbname = conn_info.get("dbname")
+        user = conn_info.get("user")
+        password = conn_info.get("password")
+
+        if not all([host, dbname, user, password]):
+            continue
+
+        db_finding = {
+            "db_label": label,
+            "target_pid": target_pid,
+            "target_status": None,
+            "blockers_found": [],
+            "error": None
+        }
+
+        conn = None
+        try:
+            conn = psycopg2.connect(host=host, port=port, dbname=dbname, user=user, password=password, connect_timeout=3)
+            cur = conn.cursor()
+
+            # 1. If target_pid specified, check its exact status in pg_stat_activity
+            if target_pid:
+                cur.execute("""
+                    SELECT pid, state, wait_event_type, wait_event, pg_blocking_pids(pid) AS blocking_pids,
+                           ROUND(EXTRACT(epoch FROM (now() - query_start)))::int AS dur,
+                           SUBSTRING(query FROM 1 FOR 300) AS q
+                    FROM pg_stat_activity
+                    WHERE pid = %s
+                """, (target_pid,))
+                row = cur.fetchone()
+                if row:
+                    db_finding["target_status"] = {
+                        "pid": row[0],
+                        "state": row[1],
+                        "wait_type": row[2],
+                        "wait_event": row[3],
+                        "blocking_pids": [int(p) for p in (row[4] or [])],
+                        "duration_sec": row[5] or 0,
+                        "query": row[6]
+                    }
+
+            # 2. Query detailed Lock Tree (pg_locks + pg_stat_activity)
+            lock_query = """
+                SELECT 
+                    blocked_locks.pid AS blocked_pid,
+                    blocking_locks.pid AS blocking_pid,
+                    blocking_activity.usename AS blocking_user,
+                    blocking_activity.state AS blocking_state,
+                    ROUND(EXTRACT(epoch FROM (now() - blocking_activity.query_start)))::int AS blocking_dur_s,
+                    ROUND(EXTRACT(epoch FROM (now() - blocking_activity.state_change)))::int AS blocking_state_dur_s,
+                    blocking_locks.mode AS lock_mode,
+                    blocking_locks.locktype AS lock_type,
+                    SUBSTRING(blocked_activity.query FROM 1 FOR 250) AS blocked_statement,
+                    SUBSTRING(blocking_activity.query FROM 1 FOR 250) AS blocking_statement
+                FROM pg_catalog.pg_locks blocked_locks
+                JOIN pg_catalog.pg_stat_activity blocked_activity ON blocked_locks.pid = blocked_activity.pid
+                JOIN pg_catalog.pg_locks blocking_locks 
+                    ON blocking_locks.locktype = blocked_locks.locktype
+                    AND blocking_locks.database IS NOT DISTINCT FROM blocked_locks.database
+                    AND blocking_locks.relation IS NOT DISTINCT FROM blocked_locks.relation
+                    AND blocking_locks.page IS NOT DISTINCT FROM blocked_locks.page
+                    AND blocking_locks.tuple IS NOT DISTINCT FROM blocked_locks.tuple
+                    AND blocking_locks.virtualxid IS NOT DISTINCT FROM blocked_locks.virtualxid
+                    AND blocking_locks.transactionid IS NOT DISTINCT FROM blocked_locks.transactionid
+                    AND blocking_locks.classid IS NOT DISTINCT FROM blocked_locks.classid
+                    AND blocking_locks.objid IS NOT DISTINCT FROM blocked_locks.objid
+                    AND blocking_locks.objsubid IS NOT DISTINCT FROM blocked_locks.objsubid
+                    AND blocking_locks.pid != blocked_locks.pid
+                JOIN pg_catalog.pg_stat_activity blocking_activity ON blocking_locks.pid = blocking_activity.pid
+            """
+            params = []
+            if target_pid:
+                lock_query += " WHERE blocked_locks.pid = %s"
+                params.append(target_pid)
+
+            cur.execute(lock_query, params)
+            for r in cur.fetchall():
+                db_finding["blockers_found"].append({
+                    "blocked_pid": r[0],
+                    "blocking_pid": r[1],
+                    "blocking_user": r[2],
+                    "blocking_state": r[3],
+                    "blocking_dur_s": r[4] or 0,
+                    "blocking_state_dur_s": r[5] or 0,
+                    "lock_mode": r[6],
+                    "lock_type": r[7],
+                    "blocked_statement": r[8],
+                    "blocking_statement": r[9] or "(idle in transaction / no active query)"
+                })
+
+            cur.close()
+            conn.close()
+        except Exception as e:
+            db_finding["error"] = str(e)
+            if conn:
+                try: conn.close()
+                except: pass
+
+        findings.append(db_finding)
+
+    return findings
+
+
 @app.post("/api/db/ai-troubleshoot-realtime")
 def ai_troubleshoot_realtime(
     req: LiveAITroubleshootRequest,
@@ -1406,6 +1573,7 @@ def ai_troubleshoot_realtime(
 ):
     """
     Instant AI Root Cause Diagnosis & Actionable Remediation for an active Lock or Slow Query.
+    Executes live database blocker investigation query first, then instructs AI with exact culprit PIDs.
     """
     setting = db.query(Setting).filter(Setting.id == 1).first()
     if not setting:
@@ -1413,24 +1581,64 @@ def ai_troubleshoot_realtime(
 
     from .analyzer import call_chat_ai
 
+    # 1. Execute live blocker query on target database
+    live_findings = []
+    if setting.db_connections_json:
+        try:
+            db_conns = json.loads(setting.db_connections_json)
+            live_findings = query_live_db_blocker_info(db_conns, target_db_label=req.db_label, target_pid=req.pid)
+        except Exception as ex:
+            print(f"[!] Error querying live blocker info: {ex}")
+
     system_prompt = (
         "คุณคือ Senior Database Administrator (DBA) และ PostgreSQL Troubleshooting Expert "
         "หน้าที่ของคุณคือรับข้อมูลคิวรีที่กำลังค้าง, คิวรีที่ติด Lock, หรือ Blocker Session ณ วินาทีนี้ "
-        "และให้คำวินิจฉัย Root Cause พร้อมคำสั่ง SQL / Linux Bash สำหรับปลดล็อคและแก้ไขทันทีใน 1-3 นาที\n\n"
-        "โครงสร้างคำตอบ:\n"
-        "1. 🚨 **Root Cause Diagnosis**: ทำไมคิวรีนี้ถึงช้า หรือ ทำไมถึงเกิด Lock Contention\n"
-        "2. ⚡ **Immediate Mitigation**: คำสั่ง SQL/Bash ที่ต้องทำทันที (เช่น สั่ง Kill PID หรือ Cancel Transaction)\n"
-        "3. 🛠️ **Permanent Solution**: แนะนำ Index, Tuning Parameters (เช่น idle_in_transaction_session_timeout, lock_timeout), หรือการแก้โค้ด ORM/Spring Boot\n"
+        "และให้คำวินิจฉัย Root Cause พร้อมระบุตัวการ Blocking PID ที่ตรวจสอบพบจริงสดๆ และให้คำสั่ง SQL สำหรับปลดล็อคและแก้ไขทันที\n\n"
+        "โครงสร้างคำตอบต้องมีหัวข้อดังนี้:\n"
+        "1. 🚨 **Root Cause Diagnosis**: สรุปสาเหตุเชิงลึกว่าทำไมคิวรีถึงช้า หรือ ทำไมถึงเกิด Lock Contention\n"
+        "2. 🔍 **Step 1: ผลการตรวจสอบ Blocker สด (Live Blocker Discovery)**: สรุปว่าพบ Blocking PID ตัวการ ID ไหนบ้าง, User อะไร, State อะไร, ถือ Lock แบบไหน และรันคำสั่งอะไรอยู่ (หากไม่พบ Blocker ให้ระบุชัดเจนว่าไม่พบ Session อื่นขัดขวาง)\n"
+        "3. ⚡ **Step 2: การปลดล็อคทันที (Immediate Mitigation Actions)**:\n"
+        "   - หากพบ Blocker ให้ระบุคำสั่ง SQL เพื่อ Kill หรือ Cancel ตัวการที่เป็นต้นเหตุ (Blocker PID) โดยใส่เลข PID จริงในคำสั่ง เช่น `SELECT pg_cancel_backend(BLOCKER_PID);` หรือ `SELECT pg_terminate_backend(BLOCKER_PID);`\n"
+        "   - หากไม่พบ Blocker แต่ Target PID ค้าง ให้ระบุคำสั่ง Kill Target PID โดยตรง เช่น `SELECT pg_terminate_backend(TARGET_PID);`\n"
+        "4. 🛠️ **Step 3: การแก้ไขที่ต้นเหตุระยะยาว (Permanent Root Cause Solution)**: แนะนำ Index, การจูนพารามิเตอร์ (เช่น `idle_in_transaction_session_timeout = '5min'`, `lock_timeout`), หรือการปรับแก้โค้ด Application / ORM / Spring Boot Transaction Scope\n"
         "ห้ามใช้ HTML Tags ให้ใช้ Markdown ล้วน"
     )
 
     context_lines = [f"ฐานข้อมูลเป้าหมาย: {req.db_label}"]
     if req.pid:
-        context_lines.append(f"Target PID: {req.pid}")
+        context_lines.append(f"Target PID ที่ส่งมาวิเคราะห์: {req.pid}")
     if req.query:
-        context_lines.append(f"SQL Statement: {req.query}")
+        context_lines.append(f"SQL Statement ของ Target: {req.query}")
     if req.lock_info:
-        context_lines.append(f"Lock Information: {json.dumps(req.lock_info, ensure_ascii=False)}")
+        context_lines.append(f"Lock Context Info: {json.dumps(req.lock_info, ensure_ascii=False)}")
+
+    # Add live query execution results to prompt
+    if live_findings:
+        context_lines.append("\n=== [ผลการเข้า Execute Query ตรวจสอบ pg_locks และ pg_stat_activity ในฐานข้อมูลสด ณ วินาทีนี้] ===")
+        for f in live_findings:
+            db_lbl = f.get("db_label")
+            if f.get("error"):
+                context_lines.append(f"- ฐานข้อมูล {db_lbl}: ❌ เชื่อมต่อไม่ได้ ({f['error']})")
+                continue
+            
+            t_stat = f.get("target_status")
+            if req.pid:
+                if t_stat:
+                    context_lines.append(f"- ฐานข้อมูล {db_lbl}: ✅ พบ PID {req.pid} ใน pg_stat_activity (State: {t_stat['state']}, รันมาแล้ว: {t_stat['duration_sec']}s, Wait: {t_stat['wait_type']}/{t_stat['wait_event']}, Blocking PIDs: {t_stat['blocking_pids']})")
+                else:
+                    context_lines.append(f"- ฐานข้อมูล {db_lbl}: ℹ️ ไม่พบ PID {req.pid} ใน pg_stat_activity (อาจทำงานเสร็จแล้วหรือหลุดไปแล้ว)")
+
+            blockers = f.get("blockers_found", [])
+            if blockers:
+                context_lines.append(f"- 🚨 ตรวจพบ Lock Contention บน {db_lbl} จำนวน {len(blockers)} รายการ:")
+                for b in blockers:
+                    context_lines.append(
+                        f"  * ⛔ Blocker PID = {b['blocking_pid']} (User: {b['blocking_user']}, State: {b['blocking_state']}, Duration: {b['blocking_dur_s']}s, Lock Mode: {b['lock_mode']}/{b['lock_type']}) กำลัง Block PID {b['blocked_pid']}\n"
+                        f"    - Blocker Statement: {b['blocking_statement']}\n"
+                        f"    - Blocked Statement: {b['blocked_statement']}"
+                    )
+            else:
+                context_lines.append(f"- ฐานข้อมูล {db_lbl}: ✅ ตรวจสอบ pg_locks แล้ว ไม่พบ Session อื่นที่กำลังถือ Lock บล็อกอยู่ (0 Blockers)")
 
     user_prompt = "กรุณาวิเคราะห์ปัญหาและแนะนำวิธีแก้ไข Real-time สำหรับสถานการณ์ต่อไปนี้:\n\n" + "\n".join(context_lines)
 
@@ -1446,6 +1654,7 @@ def ai_troubleshoot_realtime(
         "status": "success",
         "db_label": req.db_label,
         "pid": req.pid,
+        "live_findings": live_findings,
         "ai_recommendation": ai_reply
     }
 
