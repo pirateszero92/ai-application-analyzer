@@ -226,6 +226,79 @@ def _fetch_springboot_actuator_metrics(prometheus_ip: str, prometheus_port: str,
     return results
 
 
+def _fetch_node_resource_metrics(prometheus_ip: str, prometheus_port: str) -> dict:
+    """
+    Fetches real-time Node CPU %, Memory %, and Disk Read/Write MB/s from Prometheus Node Exporter.
+    Returns { ip_or_instance: { instance, nodename, cpu_pct, mem_pct, disk_read_mb, disk_write_mb } }
+    """
+    results = {}
+    if not prometheus_ip:
+        return results
+
+    base = f"http://{prometheus_ip}:{prometheus_port}/api/v1/query"
+
+    def _query(promql):
+        try:
+            r = requests.get(base, params={"query": promql}, timeout=3)
+            if r.status_code == 200:
+                return r.json().get("data", {}).get("result", [])
+        except Exception:
+            pass
+        return []
+
+    # 1. Node Info
+    for row in _query("node_uname_info"):
+        m = row.get("metric", {})
+        raw_inst = m.get("instance", "")
+        inst_ip = raw_inst.split(":")[0] if ":" in raw_inst else raw_inst
+        nodename = m.get("nodename", inst_ip)
+        if inst_ip:
+            results[inst_ip] = {
+                "instance": inst_ip,
+                "raw_instance": raw_inst,
+                "nodename": nodename,
+                "cpu_pct": 0.0,
+                "mem_pct": 0.0,
+                "disk_read_mb": 0.0,
+                "disk_write_mb": 0.0
+            }
+
+    # 2. CPU Usage %
+    for row in _query('100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[2m])) * 100)'):
+        raw_inst = row.get("metric", {}).get("instance", "")
+        inst_ip = raw_inst.split(":")[0] if ":" in raw_inst else raw_inst
+        if inst_ip in results:
+            try: results[inst_ip]["cpu_pct"] = round(float(row["value"][1]), 1)
+            except: pass
+
+    # 3. Memory Usage %
+    for row in _query('(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100'):
+        raw_inst = row.get("metric", {}).get("instance", "")
+        inst_ip = raw_inst.split(":")[0] if ":" in raw_inst else raw_inst
+        if inst_ip in results:
+            try: results[inst_ip]["mem_pct"] = round(float(row["value"][1]), 1)
+            except: pass
+
+    # 4. Disk Read MB/s
+    for row in _query('sum by (instance) (rate(node_disk_read_bytes_total[2m])) / 1048576'):
+        raw_inst = row.get("metric", {}).get("instance", "")
+        inst_ip = raw_inst.split(":")[0] if ":" in raw_inst else raw_inst
+        if inst_ip in results:
+            try: results[inst_ip]["disk_read_mb"] = round(float(row["value"][1]), 2)
+            except: pass
+
+    # 5. Disk Write MB/s
+    for row in _query('sum by (instance) (rate(node_disk_written_bytes_total[2m])) / 1048576'):
+        raw_inst = row.get("metric", {}).get("instance", "")
+        inst_ip = raw_inst.split(":")[0] if ":" in raw_inst else raw_inst
+        if inst_ip in results:
+            try: results[inst_ip]["disk_write_mb"] = round(float(row["value"][1]), 2)
+            except: pass
+
+    return results
+
+
+
 def _explain_query_plan(cur, query_text: str) -> dict:
     """
     Automated EXPLAIN Plan Analysis.

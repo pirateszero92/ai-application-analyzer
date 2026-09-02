@@ -437,6 +437,108 @@ export default function RealtimeDBMonitor({ token, API_BASE }) {
 
       </div>
 
+      {/* NODE RESOURCE TELEMETRY (LIVE CPU, RAM, DISK R/W FOR MONITORED NODES) */}
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
+        gap: '16px'
+      }}>
+        {databases.map(d => {
+          const cpuPct = d.cpu_pct ?? 0.0;
+          const memPct = d.mem_pct ?? 0.0;
+          const diskRead = d.disk_read_mb ?? 0.0;
+          const diskWrite = d.disk_write_mb ?? 0.0;
+          const cpuColor = cpuPct > 80 ? 'var(--color-danger)' : cpuPct > 50 ? 'var(--color-warning)' : 'var(--color-primary)';
+          const memColor = memPct > 85 ? 'var(--color-danger)' : memPct > 70 ? 'var(--color-warning)' : '#818cf8';
+
+          return (
+            <div
+              key={d.label}
+              className="glass-card"
+              style={{
+                padding: '16px 18px',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '12px',
+                background: 'rgba(15, 23, 42, 0.75)',
+                borderColor: d.connected ? 'var(--glass-border)' : 'rgba(244, 63, 94, 0.3)'
+              }}
+            >
+              {/* Node Header */}
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <Server size={16} style={{ color: d.connected ? 'var(--color-primary)' : 'var(--color-danger)' }} />
+                  <span style={{ fontWeight: 700, fontSize: '0.92rem', color: 'white' }}>{d.label}</span>
+                </div>
+                <span style={{
+                  fontSize: '0.72rem',
+                  padding: '2px 8px',
+                  borderRadius: '12px',
+                  background: d.connected ? 'rgba(16, 185, 129, 0.15)' : 'rgba(244, 63, 94, 0.15)',
+                  color: d.connected ? 'var(--color-success)' : 'var(--color-danger)',
+                  fontWeight: 600
+                }}>
+                  {d.connected ? `Host: ${d.host}` : 'Disconnected'}
+                </span>
+              </div>
+
+              {/* Resource Metrics Grid */}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
+                
+                {/* CPU % */}
+                <div style={{ background: 'rgba(0,0,0,0.25)', padding: '8px 10px', borderRadius: '8px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.75rem', color: 'var(--text-secondary)', marginBottom: '4px' }}>
+                    <span style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                      <Cpu size={12} style={{ color: cpuColor }} /> CPU
+                    </span>
+                    <strong style={{ color: cpuColor }}>{cpuPct.toFixed(1)}%</strong>
+                  </div>
+                  <div style={{ width: '100%', height: '4px', background: 'rgba(255,255,255,0.08)', borderRadius: '2px', overflow: 'hidden' }}>
+                    <div style={{ width: `${Math.min(cpuPct, 100)}%`, height: '100%', background: cpuColor, transition: 'width 0.5s ease' }} />
+                  </div>
+                </div>
+
+                {/* Memory % */}
+                <div style={{ background: 'rgba(0,0,0,0.25)', padding: '8px 10px', borderRadius: '8px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.75rem', color: 'var(--text-secondary)', marginBottom: '4px' }}>
+                    <span style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                      <Activity size={12} style={{ color: memColor }} /> RAM
+                    </span>
+                    <strong style={{ color: memColor }}>{memPct.toFixed(1)}%</strong>
+                  </div>
+                  <div style={{ width: '100%', height: '4px', background: 'rgba(255,255,255,0.08)', borderRadius: '2px', overflow: 'hidden' }}>
+                    <div style={{ width: `${Math.min(memPct, 100)}%`, height: '100%', background: memColor, transition: 'width 0.5s ease' }} />
+                  </div>
+                </div>
+
+              </div>
+
+              {/* Disk Read & Write MB/s */}
+              <div style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                padding: '8px 10px',
+                background: 'rgba(0,0,0,0.25)',
+                borderRadius: '8px',
+                fontSize: '0.78rem',
+                color: '#cbd5e1'
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <HardDrive size={13} style={{ color: 'var(--color-primary)' }} />
+                  <span>Disk I/O:</span>
+                </div>
+                <div style={{ display: 'flex', gap: '12px' }}>
+                  <span>Read: <strong style={{ color: '#38bdf8' }}>{diskRead.toFixed(2)} MB/s</strong></span>
+                  <span>Write: <strong style={{ color: '#fb923c' }}>{diskWrite.toFixed(2)} MB/s</strong></span>
+                </div>
+              </div>
+
+            </div>
+          );
+        })}
+      </div>
+
       {/* NAVIGATION TABS */}
       <div style={{ display: 'flex', gap: '8px', borderBottom: '1px solid var(--glass-border)', paddingBottom: '8px' }}>
         <button

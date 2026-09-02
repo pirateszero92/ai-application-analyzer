@@ -1350,17 +1350,40 @@ def collect_full_realtime_db_snapshot(db: Session):
 
         results.append(db_entry)
 
-    from .proactive_monitor import _fetch_pgbouncer_metrics, _fetch_container_metrics, _fetch_springboot_actuator_metrics
+    from .proactive_monitor import (
+        _fetch_pgbouncer_metrics, 
+        _fetch_container_metrics, 
+        _fetch_springboot_actuator_metrics,
+        _fetch_node_resource_metrics
+    )
     projects = json.loads(setting.loki_projects) if setting.loki_projects else []
     pgb_metrics = _fetch_pgbouncer_metrics(setting.prometheus_ip, setting.prometheus_port, projects)
     container_metrics = _fetch_container_metrics(setting.prometheus_ip, setting.prometheus_port, projects)
     springboot_metrics = _fetch_springboot_actuator_metrics(setting.prometheus_ip, setting.prometheus_port, projects)
+    node_metrics = _fetch_node_resource_metrics(setting.prometheus_ip, setting.prometheus_port)
+
+    # Attach node resource metrics to each database entry
+    for db_entry in results:
+        h = db_entry.get("host", "")
+        node_stat = node_metrics.get(h)
+        if not node_stat:
+            for inst_ip, n_data in node_metrics.items():
+                if h in inst_ip or inst_ip in h or (db_entry.get("label") and db_entry["label"].lower() in n_data.get("nodename", "").lower()):
+                    node_stat = n_data
+                    break
+        
+        db_entry["cpu_pct"] = node_stat.get("cpu_pct", 0.0) if node_stat else 0.0
+        db_entry["mem_pct"] = node_stat.get("mem_pct", 0.0) if node_stat else 0.0
+        db_entry["disk_read_mb"] = node_stat.get("disk_read_mb", 0.0) if node_stat else 0.0
+        db_entry["disk_write_mb"] = node_stat.get("disk_write_mb", 0.0) if node_stat else 0.0
+        db_entry["nodename"] = node_stat.get("nodename", h) if node_stat else h
 
     return {
         "timestamp": datetime.now().isoformat(),
         "total_active_connections": total_active,
         "total_lock_conflicts": total_locks,
         "databases": results,
+        "nodes": node_metrics,
         "pgbouncer": pgb_metrics,
         "containers": container_metrics,
         "springboot": springboot_metrics
