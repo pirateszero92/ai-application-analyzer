@@ -84,6 +84,29 @@ class DailySummary(Base):
     failed_runs = Column(Integer, default=0)
     created_at = Column(DateTime, server_default=func.now())
 
+class PeriodicSummary(Base):
+    """
+    Stores aggregated AI analytical executive summaries for 7-day (weekly) and 30-day (monthly) windows.
+    - period_type: 'weekly' or 'monthly'
+    - period_key: '2026-W35' (weekly) or '2026-08' (monthly)
+    """
+    __tablename__ = "periodic_summaries"
+
+    id = Column(Integer, primary_key=True, index=True)
+    period_type = Column(String, index=True, nullable=False)   # 'weekly' or 'monthly'
+    period_key = Column(String, index=True, nullable=False)     # e.g. '2026-W35' or '2026-08'
+    title = Column(String, nullable=True)                      # e.g. 'สรุปภาพรวมประจำสัปดาห์ที่ 35 (2026)'
+    start_date = Column(String, nullable=False)                # YYYY-MM-DD
+    end_date = Column(String, nullable=False)                  # YYYY-MM-DD
+    summary = Column(Text, nullable=False)
+    total_runs = Column(Integer, default=0)
+    success_runs = Column(Integer, default=0)
+    failed_runs = Column(Integer, default=0)
+    avg_health_score = Column(Float, default=100.0)
+    incident_count = Column(Integer, default=0)
+    created_at = Column(DateTime, server_default=func.now())
+
+
 class ChatMessage(Base):
     __tablename__ = "chat_messages"
 

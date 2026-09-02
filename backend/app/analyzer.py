@@ -1186,6 +1186,141 @@ def generate_daily_ai_summary(
     except Exception as e:
         return f"ไม่สามารถเชื่อมต่อไปยัง AI Provider ({provider} @ {host_url}) ได้: {str(e)}"
 
+def generate_periodic_ai_summary(
+    provider: str,
+    host_url: str,
+    model_name: str,
+    period_type: str,
+    period_label: str,
+    start_date: str,
+    end_date: str,
+    reports: list,
+    health_events: list = None,
+    daily_summaries: list = None
+) -> str:
+    """
+    Generates an Executive Multi-Day (Weekly / Monthly) AI Summary.
+    Analyzes long-term trends, recurring bottlenecks, capacity growth, and SLA stability.
+    """
+    health_events = health_events or []
+    daily_summaries = daily_summaries or []
+
+    period_title = "ประจำสัปดาห์ (Weekly 7-Day Executive Report)" if period_type == "weekly" else "ประจำเดือน (Monthly 30-Day Executive Report)"
+    print(f"[*] Generating {period_type} summary for {period_label} ({start_date} to {end_date}) across {len(reports)} runs & {len(health_events)} health events...")
+
+    total_runs = len(reports)
+    success_runs = sum(1 for r in reports if r.status == "success")
+    failed_runs = sum(1 for r in reports if r.status == "failed")
+    sla_pct = (success_runs / total_runs * 100) if total_runs > 0 else 100.0
+
+    avg_score = 100.0
+    if health_events:
+        avg_score = sum(h.health_score for h in health_events) / len(health_events)
+
+    # 1. Summarize Daily Summaries
+    daily_summaries_text = ""
+    if daily_summaries:
+        daily_summaries_text = "\n### สรุปภาพรวมรายวันที่มีบันทึกไว้ในระบบ:\n"
+        for ds in daily_summaries:
+            preview = ds.summary[:1200] if ds.summary else "ไม่มีสรุป"
+            daily_summaries_text += f"\n- **วันที่ {ds.date}** (Runs: {ds.total_runs}, สำเร็จ: {ds.success_runs}, ล้มเหลว: {ds.failed_runs}):\n{preview}...\n"
+    else:
+        daily_summaries_text = "\n(ไม่มีบันทึกสรุปรายวันสะสมในรอบเวลานี้ ใช้ข้อมูลจากการรันย่อยโดยตรง)\n"
+
+    # 2. Extract recent bottlenecks / error summaries from reports
+    reports_sample_text = ""
+    recent_reports = reports[-30:] if len(reports) > 30 else reports
+    for r in recent_reports:
+        if r.status == "success" and r.summary:
+            reports_sample_text += f"\n- [{r.timestamp.strftime('%d/%m %H:%M')}] {r.summary[:350]}...\n"
+        elif r.status == "failed":
+            reports_sample_text += f"\n- [⚠️ FAILED {r.timestamp.strftime('%d/%m %H:%M')}] {r.error_message}\n"
+
+    system_prompt = (
+        f"คุณคือ Senior Enterprise DevOps Architect & Chief DBA "
+        f"หน้าที่ของคุณคือการวิเคราะห์รายงานสรุปภาพรวมผู้บริหาร {period_title} "
+        f"สำหรับช่วงเวลา {start_date} ถึง {end_date} ({period_label}) "
+        f"สรุปแนวโน้มทางสถิติ, คอขวดที่เกิดซ้ำซากตลอดช่วงเวลา, เสถียรภาพของระบบ (SLA), และ Roadmap การปรับปรุงระดับองค์กร\n\n"
+        "กฎเหล็ก: ใช้ภาษาไทยที่เป็นทางการ เข้าใจง่าย ชัดเจน ตรงประเด็น และใช้ Pure Markdown เท่านั้น"
+    )
+
+    user_prompt = f"""กรุณาวิเคราะห์และจัดทำรายงานสรุปภาพรวม {period_title} ({period_label})
+ช่วงวันที่: {start_date} ถึง {end_date}
+
+## ข้อมูลสถิติเชิงปริมาณตลอดรอบเวลา:
+- จำนวนรอบการวิเคราะห์ทั้งหมด: {total_runs:,} ครั้ง (สำเร็จ: {success_runs:,} ครั้ง, ล้มเหลว: {failed_runs:,} ครั้ง)
+- ดัชนีความเสถียรของระบบ (SLA Reliability): {sla_pct:.2f}%
+- คะแนนสุขภาพเฉลี่ยของระบบ (Average Health Score): {avg_score:.1f} / 100
+- จำนวนเหตุการณ์ Anomaly / Alert ทั้งหมด: {len(health_events):,} เหตุการณ์
+
+{daily_summaries_text}
+
+## ตัวอย่างคอขวดและเหตุการณ์ที่บันทึกไว้ในรอบเวลา:
+{reports_sample_text}
+
+---
+
+จงวิเคราะห์และจัดทำรายงานสรุปตามโครงสร้างหัวข้อต่อไปนี้:
+
+1. 📊 **บทสรุปสำหรับผู้บริหารและดัชนีชี้วัด (Executive Summary & SLA KPIs)**
+   - สรุปภาพรวมความเสถียรของระบบตลอดช่วง {period_label}
+   - การประเมินความพร้อมใช้งาน (Availability) และคะแนนสุขภาพ (Health Score {avg_score:.1f}/100)
+
+2. 🔍 **แนวโน้มและคอขวดเรื้อรังที่เกิดซ้ำ (Recurring Bottlenecks & Chronic Issue Analysis)**
+   - ปัญหา Slow Query, Lock Contention, หรือ Resource Spikes (CPU/Memory/Disk I/O) ที่เกิดขึ้นซ้ำๆ บ่อยที่สุด
+   - พฤติกรรมของ Connection Pool (PgBouncer และ Spring Boot HikariCP) ในช่วง Peak Hours
+
+3. 🏗️ **การประเมินขีดความสามารถและการเติบโตของโหลด (Capacity & Growth Assessment)**
+   - ทรัพยากรส่วนใดเริ่มเข้าใกล้ขีดจำกัด (เช่น Disk I/O บน Database, Connection saturation, Buffer cache)
+
+4. 🛠️ **แผนกลยุทธ์การปรับปรุงระยะยาว (Strategic Architecture & DBA Tuning Roadmap)**
+   - แผนการสร้าง Index เพิ่มเติม หรือปรับโครงสร้าง Query
+   - การปรับจูนพารามิเตอร์ PostgreSQL / PgBouncer เพื่อรองรับการขยายตัวในอนาคต
+   - แผนงานสิ่งที่ต้องดำเนินการในรอบสัปดาห์/เดือนถัดไป (Action Items)"""
+
+    api_url = f"{host_url.rstrip('/')}/chat/completions"
+    is_ollama_native = False
+    if provider == "ollama" and "/v1" not in host_url and ":11434" in host_url:
+        api_url = f"{host_url.rstrip('/')}/api/chat"
+        is_ollama_native = True
+
+    if is_ollama_native:
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            "options": {"temperature": 0.2},
+            "stream": False
+        }
+    else:
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            "temperature": 0.2,
+            "stream": False
+        }
+
+    try:
+        response = requests.post(api_url, json=payload, timeout=600)
+        if response.status_code == 200:
+            resp_data = response.json()
+            if is_ollama_native:
+                return resp_data.get("message", {}).get("content", "No content returned from Ollama")
+            choices = resp_data.get('choices', [])
+            if not choices:
+                return "AI returned empty response"
+            return choices[0].get('message', {}).get('content', 'No content in AI response')
+        else:
+            return f"AI Provider API Error: Status {response.status_code} - {response.text}"
+    except Exception as e:
+        return f"ไม่สามารถเชื่อมต่อไปยัง AI Provider: {str(e)}"
+
+
 def run_analysis_job(db: Session, report_id: int):
     # Fetch report placeholder
     report = db.query(Report).filter(Report.id == report_id).first()

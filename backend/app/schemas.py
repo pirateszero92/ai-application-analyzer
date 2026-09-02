@@ -135,6 +135,24 @@ class DailySummaryResponse(BaseModel):
     class Config:
         from_attributes = True
 
+class PeriodicSummaryResponse(BaseModel):
+    id: int
+    period_type: str
+    period_key: str
+    title: Optional[str] = None
+    start_date: str
+    end_date: str
+    summary: str
+    total_runs: int
+    success_runs: int
+    failed_runs: int
+    avg_health_score: float
+    incident_count: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
 class ChatMessageCreate(BaseModel):
     content: str
 

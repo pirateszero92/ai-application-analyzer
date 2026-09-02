@@ -13,17 +13,17 @@ from sqlalchemy.orm import Session
 from typing import List, Optional, Dict, Any
 
 from .database import SessionLocal, engine, Base, get_db
-from .models import User, Setting, Report, DailySummary, ChatMessage, HealthEvent, BenchmarkReport
+from .models import User, Setting, Report, DailySummary, PeriodicSummary, ChatMessage, HealthEvent, BenchmarkReport
 from .schemas import (
     UserLogin, Token, UserChangePassword, UserResponse,
     SettingResponse, SettingUpdate, ReportResponse, ReportDetailResponse,
-    DailySummaryResponse, ChatMessageCreate, ChatMessageResponse, HealthEventResponse
+    DailySummaryResponse, PeriodicSummaryResponse, ChatMessageCreate, ChatMessageResponse, HealthEventResponse
 )
 from .auth import (
     verify_password, get_password_hash, create_access_token, get_current_user
 )
 from .scheduler import start_scheduler, stop_scheduler, REDIS_URL
-from .analyzer import run_analysis_job, generate_daily_ai_summary, call_chat_ai
+from .analyzer import run_analysis_job, generate_daily_ai_summary, generate_periodic_ai_summary, call_chat_ai
 from .proactive_monitor import run_proactive_health_check
 
 def safe_json_loads(value, fallback):
@@ -378,6 +378,190 @@ def list_daily_summaries(
     """
     summaries = db.query(DailySummary).order_by(DailySummary.date.desc()).limit(limit).all()
     return summaries
+
+
+@app.get("/api/reports/periodic-summary", response_model=PeriodicSummaryResponse)
+def get_periodic_summary(
+    period_type: str,     # 'weekly' or 'monthly'
+    period_key: str,      # '2026-W35' (weekly) or '2026-08' (monthly)
+    force: bool = False,
+    generate: bool = False,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Fetches or generates a 7-day Weekly or 30-day Monthly Executive Summary with AI.
+    Analyzes historical trends, chronic slow queries, and infrastructure capacity growth.
+    """
+    import calendar
+    from datetime import date as dt_date
+
+    # 1. Validate and calculate date range
+    if period_type == "weekly":
+        try:
+            parts = period_key.split("-W")
+            year, week = int(parts[0]), int(parts[1])
+            first_day = dt_date.fromisocalendar(year, week, 1)
+            last_day = dt_date.fromisocalendar(year, week, 7)
+            start_date_str = first_day.strftime("%Y-%m-%d")
+            end_date_str = last_day.strftime("%Y-%m-%d")
+            period_label = f"สัปดาห์ที่ {week} ({first_day.strftime('%d/%m')} - {last_day.strftime('%d/%m/%Y')})"
+        except Exception:
+            raise HTTPException(status_code=400, detail="รูปแบบรหัสสัปดาห์ไม่ถูกต้อง กรุณาใช้ YYYY-Www (เช่น 2026-W35)")
+    elif period_type == "monthly":
+        try:
+            parts = period_key.split("-")
+            year, month = int(parts[0]), int(parts[1])
+            first_day = dt_date(year, month, 1)
+            last_day_num = calendar.monthrange(year, month)[1]
+            last_day = dt_date(year, month, last_day_num)
+            start_date_str = first_day.strftime("%Y-%m-%d")
+            end_date_str = last_day.strftime("%Y-%m-%d")
+            month_names_th = ["", "มกราคม", "กุมภาพันธ์", "มีนาคม", "เมษายน", "พฤษภาคม", "มิถุนายน", "กรกฎาคม", "สิงหาคม", "กันยายน", "ตุลาคม", "พฤศจิกายน", "ธันวาคม"]
+            month_name = month_names_th[month] if month <= 12 else str(month)
+            period_label = f"เดือน {month_name} {year}"
+        except Exception:
+            raise HTTPException(status_code=400, detail="รูปแบบรหัสเดือนไม่ถูกต้อง กรุณาใช้ YYYY-MM (เช่น 2026-08)")
+    else:
+        raise HTTPException(status_code=400, detail="period_type ต้องเป็น 'weekly' หรือ 'monthly'")
+
+    # 2. Check cached summary
+    cached = db.query(PeriodicSummary).filter(
+        PeriodicSummary.period_type == period_type,
+        PeriodicSummary.period_key == period_key
+    ).first()
+
+    # If cached exists and not forcing refresh, return it
+    if cached and not force and not generate:
+        return cached
+
+    # 3. Query all reports in date range (30-day live log window)
+    start_dt = datetime.combine(first_day, datetime.min.time())
+    end_dt = datetime.combine(last_day, datetime.max.time())
+
+    reports = db.query(Report).filter(
+        and_(Report.timestamp >= start_dt, Report.timestamp <= end_dt)
+    ).order_by(Report.timestamp.asc()).all()
+
+    # Query health events and daily summaries in range
+    health_events = db.query(HealthEvent).filter(
+        and_(HealthEvent.timestamp >= start_dt, HealthEvent.timestamp <= end_dt)
+    ).order_by(HealthEvent.timestamp.asc()).all()
+
+    daily_summaries = db.query(DailySummary).filter(
+        and_(DailySummary.date >= start_date_str, DailySummary.date <= end_date_str)
+    ).order_by(DailySummary.date.asc()).all()
+
+    if not reports and not health_events:
+        raise HTTPException(status_code=404, detail=f"ไม่พบประวัติงานรันวิเคราะห์ในช่วง {period_label}")
+
+    total_runs = len(reports)
+    success_runs = sum(1 for r in reports if r.status == "success")
+    failed_runs = sum(1 for r in reports if r.status == "failed")
+    avg_score = 100.0
+    if health_events:
+        avg_score = sum(h.health_score for h in health_events) / len(health_events)
+
+    if not generate and not cached:
+        raise HTTPException(
+            status_code=404,
+            detail=f"ยังไม่ได้สร้างรายงานสรุป {period_label} กดปุ่ม 'สั่ง AI สรุปรายงาน' เพื่อสร้างได้ทันที"
+        )
+
+    # 4. Generate AI summary
+    setting = db.query(Setting).filter(Setting.id == 1).first()
+    if not setting:
+        raise HTTPException(status_code=500, detail="ไม่พบการตั้งค่าในระบบ")
+
+    summary_text = generate_periodic_ai_summary(
+        provider=setting.ai_provider,
+        host_url=setting.ai_host_url,
+        model_name=setting.ai_model_name,
+        period_type=period_type,
+        period_label=period_label,
+        start_date=start_date_str,
+        end_date=end_date_str,
+        reports=reports,
+        health_events=health_events,
+        daily_summaries=daily_summaries
+    )
+
+    # 5. Save to database
+    if cached:
+        cached.title = period_label
+        cached.summary = summary_text
+        cached.total_runs = total_runs
+        cached.success_runs = success_runs
+        cached.failed_runs = failed_runs
+        cached.avg_health_score = round(avg_score, 1)
+        cached.incident_count = len(health_events)
+        db.commit()
+        db.refresh(cached)
+        return cached
+    else:
+        new_summary = PeriodicSummary(
+            period_type=period_type,
+            period_key=period_key,
+            title=period_label,
+            start_date=start_date_str,
+            end_date=end_date_str,
+            summary=summary_text,
+            total_runs=total_runs,
+            success_runs=success_runs,
+            failed_runs=failed_runs,
+            avg_health_score=round(avg_score, 1),
+            incident_count=len(health_events)
+        )
+        db.add(new_summary)
+        db.commit()
+        db.refresh(new_summary)
+        return new_summary
+
+
+@app.get("/api/reports/periodic-summaries", response_model=List[PeriodicSummaryResponse])
+def list_periodic_summaries(
+    period_type: Optional[str] = None,
+    limit: int = 50,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Returns historical weekly or monthly executive summaries.
+    """
+    q = db.query(PeriodicSummary)
+    if period_type:
+        q = q.filter(PeriodicSummary.period_type == period_type)
+    return q.order_by(PeriodicSummary.id.desc()).limit(limit).all()
+
+
+@app.get("/api/reports/retention-status")
+def get_log_retention_status(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Returns the log retention policy status (30-day live logs & archives in MinIO).
+    """
+    from datetime import datetime, timedelta
+    thirty_days_ago = datetime.now() - timedelta(days=30)
+    
+    total_reports = db.query(Report).count()
+    reports_in_30d = db.query(Report).filter(Report.timestamp >= thirty_days_ago).count()
+    oldest_report = db.query(Report).order_by(Report.timestamp.asc()).first()
+    total_health_events = db.query(HealthEvent).count()
+    daily_summaries_count = db.query(DailySummary).count()
+    periodic_summaries_count = db.query(PeriodicSummary).count()
+
+    return {
+        "retention_policy_days": 30,
+        "total_historical_reports": total_reports,
+        "reports_within_30_days": reports_in_30d,
+        "total_proactive_health_events": total_health_events,
+        "total_daily_summaries": daily_summaries_count,
+        "total_periodic_summaries": periodic_summaries_count,
+        "oldest_log_timestamp": oldest_report.timestamp.isoformat() if oldest_report and oldest_report.timestamp else None,
+        "storage_mode": "PostgreSQL Metadata + MinIO Object Storage 30-day Archive"
+    }
 
 
 @app.get("/api/reports/{report_id}", response_model=ReportDetailResponse)
