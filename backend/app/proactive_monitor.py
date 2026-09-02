@@ -365,6 +365,9 @@ def _fetch_db_health(db_connections_json_str: str) -> list:
                            SUBSTRING(query FROM 1 FOR 150) AS q
                     FROM pg_stat_activity
                     WHERE state != 'idle' AND pid != pg_backend_pid()
+                      AND backend_type != 'walsender'
+                      AND query NOT ILIKE 'START_REPLICATION%'
+                      AND query NOT ILIKE 'autovacuum:%'
                       AND query_start IS NOT NULL
                       AND EXTRACT(epoch FROM (now() - query_start)) > %s
                     ORDER BY dur DESC LIMIT 5
