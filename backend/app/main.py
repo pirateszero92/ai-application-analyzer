@@ -1224,6 +1224,33 @@ def collect_full_realtime_db_snapshot(db: Session):
             except Exception:
                 conn.rollback()
 
+            # 1.2 Direct Engine I/O, Buffer Hit, and CPU Workers Stats
+            try:
+                cur.execute("""
+                    SELECT 
+                        ROUND(sum(blks_hit) / NULLIF(sum(blks_hit) + sum(blks_read), 0) * 100, 1) AS cache_hit_pct,
+                        ROUND(sum(blks_read) * 8.0 / 1024, 2) AS total_read_mb,
+                        ROUND(sum(blks_hit) * 8.0 / 1024, 2) AS total_hit_mb,
+                        ROUND(sum(temp_bytes) / 1048576.0, 2) AS temp_mb,
+                        (SELECT count(*) FROM pg_stat_activity WHERE state = 'active' AND (wait_event_type IS NULL OR wait_event_type = 'CPU')) AS cpu_active_workers,
+                        (SELECT count(*) FROM pg_stat_activity WHERE state != 'idle' AND pid != pg_backend_pid() AND backend_type != 'walsender') AS total_active_sessions,
+                        (SELECT count(*) FROM pg_stat_activity WHERE pid != pg_backend_pid()) AS total_connected,
+                        (SELECT ROUND((buffers_checkpoint + buffers_clean + buffers_backend) * 8.0 / 1024, 2) FROM pg_stat_bgwriter) AS total_write_mb
+                    FROM pg_stat_database;
+                """)
+                io_row = cur.fetchone()
+                if io_row:
+                    db_entry["cache_hit_pct"] = float(io_row[0] or 100.0)
+                    db_entry["db_read_mb"] = float(io_row[1] or 0.0)
+                    db_entry["db_hit_mb"] = float(io_row[2] or 0.0)
+                    db_entry["db_temp_mb"] = float(io_row[3] or 0.0)
+                    db_entry["cpu_active_workers"] = int(io_row[4] or 0)
+                    db_entry["total_active_sessions"] = int(io_row[5] or 0)
+                    db_entry["total_connected"] = int(io_row[6] or 0)
+                    db_entry["db_write_mb"] = float(io_row[7] or 0.0)
+            except Exception:
+                conn.rollback()
+
             # 2. Lock Tree / Blocking Sessions Graph (Deadlocks & Lock Contention)
             try:
                 cur.execute("""
@@ -1368,15 +1395,25 @@ def collect_full_realtime_db_snapshot(db: Session):
         node_stat = node_metrics.get(h)
         if not node_stat:
             for inst_ip, n_data in node_metrics.items():
-                if h in inst_ip or inst_ip in h or (db_entry.get("label") and db_entry["label"].lower() in n_data.get("nodename", "").lower()):
+                if h in inst_ip or inst_ip in h:
                     node_stat = n_data
                     break
         
-        db_entry["cpu_pct"] = node_stat.get("cpu_pct", 0.0) if node_stat else 0.0
-        db_entry["mem_pct"] = node_stat.get("mem_pct", 0.0) if node_stat else 0.0
-        db_entry["disk_read_mb"] = node_stat.get("disk_read_mb", 0.0) if node_stat else 0.0
-        db_entry["disk_write_mb"] = node_stat.get("disk_write_mb", 0.0) if node_stat else 0.0
-        db_entry["nodename"] = node_stat.get("nodename", h) if node_stat else h
+        if node_stat:
+            db_entry["has_node_exporter"] = True
+            db_entry["cpu_pct"] = node_stat.get("cpu_pct", 0.0)
+            db_entry["mem_pct"] = node_stat.get("mem_pct", 0.0)
+            db_entry["disk_read_mb"] = node_stat.get("disk_read_mb", 0.0)
+            db_entry["disk_write_mb"] = node_stat.get("disk_write_mb", 0.0)
+            db_entry["nodename"] = node_stat.get("nodename", h)
+        else:
+            db_entry["has_node_exporter"] = False
+            # Direct engine metrics
+            db_entry["cpu_pct"] = float(db_entry.get("cpu_active_workers", 0) * 5.0)  # active CPU worker metric
+            db_entry["mem_pct"] = db_entry.get("conn_pct", 0.0)
+            db_entry["disk_read_mb"] = db_entry.get("db_read_mb", 0.0)
+            db_entry["disk_write_mb"] = db_entry.get("db_write_mb", 0.0)
+            db_entry["nodename"] = h
 
     return {
         "timestamp": datetime.now().isoformat(),
