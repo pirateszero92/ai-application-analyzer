@@ -19,10 +19,14 @@ import {
   Radio, 
   Bot, 
   ChevronRight, 
-  AlertOctagon,
-  HelpCircle,
-  Copy,
-  Check
+  AlertOctagon, 
+  HelpCircle, 
+  Copy, 
+  Check,
+  Maximize2,
+  Minimize2,
+  Move,
+  X
 } from 'lucide-react';
 
 export default function RealtimeDBMonitor({ token, API_BASE }) {
@@ -35,7 +39,89 @@ export default function RealtimeDBMonitor({ token, API_BASE }) {
   const [copySuccess, setCopySuccess] = useState(false);
   const [activeTab, setActiveTab] = useState('locks'); // 'locks' | 'queries' | 'wait_events' | 'pgbouncer'
 
+  // Draggable & Resizable Modal State
+  const [modalPos, setModalPos] = useState({ x: 80, y: 50 });
+  const [modalSize, setModalSize] = useState({ width: 850, height: 600 });
+  const [isMaximized, setIsMaximized] = useState(false);
+  
+  const isDraggingRef = useRef(false);
+  const dragStartRef = useRef({ mouseX: 0, mouseY: 0, modalX: 0, modalY: 0 });
+
+  const isResizingRef = useRef(false);
+  const resizeStartRef = useRef({ mouseX: 0, mouseY: 0, startW: 0, startH: 0 });
+
   const eventSourceRef = useRef(null);
+
+  // Initialize modal position & size on open
+  useEffect(() => {
+    if (aiModalData) {
+      setIsMaximized(false);
+      const initialW = Math.min(window.innerWidth * 0.85, 880);
+      const initialH = Math.min(window.innerHeight * 0.80, 640);
+      setModalSize({ width: initialW, height: initialH });
+      setModalPos({
+        x: Math.max(16, (window.innerWidth - initialW) / 2),
+        y: Math.max(24, (window.innerHeight - initialH) / 2)
+      });
+    }
+  }, [aiModalData?.timestamp]);
+
+  // Global mousemove and mouseup listeners for dragging and resizing
+  useEffect(() => {
+    const handleMouseMove = (e) => {
+      if (isDraggingRef.current && !isMaximized) {
+        const dx = e.clientX - dragStartRef.current.mouseX;
+        const dy = e.clientY - dragStartRef.current.mouseY;
+        const newX = Math.max(10, Math.min(window.innerWidth - 120, dragStartRef.current.modalX + dx));
+        const newY = Math.max(10, Math.min(window.innerHeight - 80, dragStartRef.current.modalY + dy));
+        setModalPos({ x: newX, y: newY });
+      }
+      if (isResizingRef.current && !isMaximized) {
+        const dx = e.clientX - resizeStartRef.current.mouseX;
+        const dy = e.clientY - resizeStartRef.current.mouseY;
+        const newW = Math.max(420, Math.min(window.innerWidth - 30, resizeStartRef.current.startW + dx));
+        const newH = Math.max(300, Math.min(window.innerHeight - 30, resizeStartRef.current.startH + dy));
+        setModalSize({ width: newW, height: newH });
+      }
+    };
+
+    const handleMouseUp = () => {
+      isDraggingRef.current = false;
+      isResizingRef.current = false;
+    };
+
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [isMaximized]);
+
+  const onDragStart = (e) => {
+    if (isMaximized) return;
+    // Don't drag if clicking buttons
+    if (e.target.closest('button')) return;
+    isDraggingRef.current = true;
+    dragStartRef.current = {
+      mouseX: e.clientX,
+      mouseY: e.clientY,
+      modalX: modalPos.x,
+      modalY: modalPos.y
+    };
+  };
+
+  const onResizeStart = (e) => {
+    e.stopPropagation();
+    if (isMaximized) return;
+    isResizingRef.current = true;
+    resizeStartRef.current = {
+      mouseX: e.clientX,
+      mouseY: e.clientY,
+      startW: modalSize.width,
+      startH: modalSize.height
+    };
+  };
 
   // 1. Setup Server-Sent Events (SSE) live connection
   useEffect(() => {
@@ -140,6 +226,7 @@ export default function RealtimeDBMonitor({ token, API_BASE }) {
       pid,
       query,
       lockInfo,
+      timestamp: Date.now(),
       recommendation: null
     });
 
@@ -773,7 +860,7 @@ export default function RealtimeDBMonitor({ token, API_BASE }) {
         </div>
       )}
 
-      {/* AI TROUBLESHOOTING MODAL / FLOATING PANEL */}
+      {/* AI TROUBLESHOOTING MODAL / FLOATING PANEL (DRAGGABLE & RESIZABLE) */}
       {aiModalData && (
         <div style={{
           position: 'fixed',
@@ -781,52 +868,100 @@ export default function RealtimeDBMonitor({ token, API_BASE }) {
           left: 0,
           right: 0,
           bottom: 0,
-          background: 'rgba(0, 0, 0, 0.75)',
-          backdropFilter: 'blur(8px)',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
+          background: 'rgba(0, 0, 0, 0.65)',
+          backdropFilter: 'blur(6px)',
           zIndex: 9999,
-          padding: '20px'
+          pointerEvents: 'auto'
         }}>
-          <div className="glass-card" style={{
-            width: '100%',
-            maxWidth: '850px',
-            maxHeight: '90vh',
-            display: 'flex',
-            flexDirection: 'column',
-            background: 'rgba(15, 23, 42, 0.98)',
-            borderColor: 'var(--color-primary)',
-            boxShadow: '0 25px 60px rgba(0,0,0,0.6)',
-            padding: '28px',
-            overflow: 'hidden'
-          }}>
-            
-            {/* Modal Header */}
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px', borderBottom: '1px solid var(--glass-border)', paddingBottom: '14px' }}>
+          <div
+            className="glass-card"
+            style={{
+              position: 'fixed',
+              left: isMaximized ? '16px' : `${modalPos.x}px`,
+              top: isMaximized ? '16px' : `${modalPos.y}px`,
+              width: isMaximized ? 'calc(100vw - 32px)' : `${modalSize.width}px`,
+              height: isMaximized ? 'calc(100vh - 32px)' : `${modalSize.height}px`,
+              maxWidth: 'calc(100vw - 20px)',
+              maxHeight: 'calc(100vh - 20px)',
+              display: 'flex',
+              flexDirection: 'column',
+              background: 'rgba(15, 23, 42, 0.98)',
+              borderColor: 'var(--color-primary)',
+              boxShadow: '0 25px 60px rgba(0,0,0,0.8), 0 0 20px rgba(6, 182, 212, 0.25)',
+              borderRadius: '16px',
+              padding: 0,
+              overflow: 'hidden',
+              userSelect: isDraggingRef.current ? 'none' : 'auto',
+              boxSizing: 'border-box'
+            }}
+          >
+            {/* Modal Header (Drag Handle) */}
+            <div
+              onMouseDown={onDragStart}
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                padding: '14px 20px',
+                borderBottom: '1px solid var(--glass-border)',
+                background: 'rgba(30, 41, 59, 0.7)',
+                cursor: isMaximized ? 'default' : 'grab',
+                flexShrink: 0
+              }}
+            >
               <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                <Bot size={24} style={{ color: 'var(--color-primary)' }} />
+                <div style={{ padding: '8px', borderRadius: '8px', background: 'rgba(6, 182, 212, 0.15)', color: 'var(--color-primary)' }}>
+                  <Bot size={22} />
+                </div>
                 <div>
-                  <h3 style={{ fontSize: '1.25rem', fontWeight: 700 }}>Real-time AI Root Cause Troubleshooter</h3>
-                  <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Target: {aiModalData.dbLabel} {aiModalData.pid ? `(PID ${aiModalData.pid})` : ''}</span>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <h3 style={{ fontSize: '1.15rem', fontWeight: 700, margin: 0, color: 'white' }}>
+                      Real-time AI Root Cause Troubleshooter
+                    </h3>
+                    <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', background: 'rgba(255,255,255,0.06)', padding: '2px 6px', borderRadius: '4px' }}>
+                      {isMaximized ? 'เต็มจอ' : 'ลากย้ายได้'}
+                    </span>
+                  </div>
+                  <span style={{ fontSize: '0.8rem', color: 'var(--color-primary)' }}>
+                    Target DB: <strong>{aiModalData.dbLabel}</strong> {aiModalData.pid ? `| PID: ${aiModalData.pid}` : ''}
+                  </span>
                 </div>
               </div>
 
-              <button
-                onClick={() => setAiModalData(null)}
-                className="btn-secondary"
-                style={{ padding: '6px 12px', fontSize: '0.85rem' }}
-              >
-                ✕ ปิด
-              </button>
+              {/* Window Controls */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <button
+                  onClick={() => setIsMaximized(prev => !prev)}
+                  className="btn-secondary"
+                  title={isMaximized ? 'ย่อขนาด (Restore)' : 'ขยายเต็มจอ (Maximize)'}
+                  style={{ padding: '6px 10px', borderRadius: '8px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                >
+                  {isMaximized ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
+                </button>
+                <button
+                  onClick={() => setAiModalData(null)}
+                  className="btn-secondary"
+                  title="ปิด (Close)"
+                  style={{ padding: '6px 10px', borderRadius: '8px', color: 'var(--color-danger)', borderColor: 'rgba(244, 63, 94, 0.3)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                >
+                  <X size={16} />
+                </button>
+              </div>
             </div>
 
-            {/* Modal Body */}
-            <div style={{ flex: 1, overflowY: 'auto', paddingRight: '8px' }}>
+            {/* Modal Body with smooth scrolling */}
+            <div style={{
+              flex: 1,
+              overflowY: 'auto',
+              padding: '24px',
+              fontSize: '0.92rem',
+              lineHeight: 1.7,
+              color: '#e2e8f0'
+            }}>
               {aiLoading ? (
-                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '60px 0', gap: '16px' }}>
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', minHeight: '260px', gap: '16px' }}>
                   <RefreshCw size={36} className="spin" style={{ color: 'var(--color-primary)' }} />
-                  <p style={{ color: 'var(--text-secondary)', fontSize: '0.95rem' }}>AI กำลังวิเคราะห์ Root Cause, Lock Contention, และสร้างคำสั่งแก้ไขด่วน...</p>
+                  <p style={{ color: 'var(--text-secondary)', fontSize: '0.95rem' }}>AI กำลัง Execute ตรวจสอบ Blocker สด และวิเคราะห์แนวทางแก้ไขแบบ Real-time...</p>
                 </div>
               ) : (
                 <div>
@@ -837,26 +972,67 @@ export default function RealtimeDBMonitor({ token, API_BASE }) {
 
             {/* Modal Footer */}
             {!aiLoading && aiModalData.recommendation && (
-              <div style={{ marginTop: '20px', paddingTop: '14px', borderTop: '1px solid var(--glass-border)', display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
-                <button
-                  onClick={() => {
-                    navigator.clipboard.writeText(aiModalData.recommendation);
-                    setCopySuccess(true);
-                    setTimeout(() => setCopySuccess(false), 2000);
-                  }}
-                  className="btn-secondary"
-                  style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '8px 14px' }}
-                >
-                  {copySuccess ? <Check size={14} style={{ color: 'var(--color-success)' }} /> : <Copy size={14} />}
-                  <span>{copySuccess ? 'คัดลอกแล้ว!' : 'คัดลอกคำแนะนำ'}</span>
-                </button>
-                <button
-                  onClick={() => setAiModalData(null)}
-                  className="btn-primary"
-                  style={{ padding: '8px 18px' }}
-                >
-                  เสร็จสิ้น
-                </button>
+              <div style={{
+                padding: '14px 20px',
+                borderTop: '1px solid var(--glass-border)',
+                background: 'rgba(15, 23, 42, 0.95)',
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                flexShrink: 0
+              }}>
+                <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                  💡 สามารถลากมุมขวาล่างเพื่อย่อ/ขยาย หรือกดปุ่ม ⛶ ขยายเต็มจอได้
+                </span>
+                <div style={{ display: 'flex', gap: '10px' }}>
+                  <button
+                    onClick={() => {
+                      navigator.clipboard.writeText(aiModalData.recommendation);
+                      setCopySuccess(true);
+                      setTimeout(() => setCopySuccess(false), 2000);
+                    }}
+                    className="btn-secondary"
+                    style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '8px 14px' }}
+                  >
+                    {copySuccess ? <Check size={14} style={{ color: 'var(--color-success)' }} /> : <Copy size={14} />}
+                    <span>{copySuccess ? 'คัดลอกแล้ว!' : 'คัดลอกคำแนะนำ'}</span>
+                  </button>
+                  <button
+                    onClick={() => setAiModalData(null)}
+                    className="btn-primary"
+                    style={{ padding: '8px 18px' }}
+                  >
+                    เสร็จสิ้น
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Resizing Handle (Corner Grip) */}
+            {!isMaximized && (
+              <div
+                onMouseDown={onResizeStart}
+                style={{
+                  position: 'absolute',
+                  right: 0,
+                  bottom: 0,
+                  width: '20px',
+                  height: '20px',
+                  cursor: 'nwse-resize',
+                  zIndex: 10,
+                  display: 'flex',
+                  alignItems: 'flex-end',
+                  justifyContent: 'flex-end',
+                  padding: '3px'
+                }}
+              >
+                <div style={{
+                  width: '10px',
+                  height: '10px',
+                  borderRight: '2px solid var(--color-primary)',
+                  borderBottom: '2px solid var(--color-primary)',
+                  opacity: 0.6
+                }} />
               </div>
             )}
 
