@@ -514,7 +514,7 @@ export default function RealtimeDBMonitor({ token, API_BASE }) {
                       <Activity size={12} style={{ color: memColor }} /> {hasExporter ? 'RAM' : 'Pool'}
                     </span>
                     <strong style={{ color: memColor }}>
-                      {hasExporter ? `${memPct.toFixed(1)}%` : `${d.conn_pct ?? 0}%`}
+                      {hasExporter ? `${memPct.toFixed(1)}%` : `${d.conn_active ?? 0}/${d.conn_max ?? 100}`}
                     </strong>
                   </div>
                   <div style={{ width: '100%', height: '4px', background: 'rgba(255,255,255,0.08)', borderRadius: '2px', overflow: 'hidden' }}>
@@ -524,7 +524,7 @@ export default function RealtimeDBMonitor({ token, API_BASE }) {
 
               </div>
 
-              {/* Disk Read & Write / Cache Hit */}
+              {/* Disk Read & Write MB/s Rate */}
               <div style={{
                 display: 'flex',
                 justifyContent: 'space-between',
@@ -537,11 +537,11 @@ export default function RealtimeDBMonitor({ token, API_BASE }) {
               }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                   <HardDrive size={13} style={{ color: 'var(--color-primary)' }} />
-                  <span>{hasExporter ? 'Disk I/O:' : `Cache ${cacheHit.toFixed(1)}%:`}</span>
+                  <span>Disk I/O:</span>
                 </div>
                 <div style={{ display: 'flex', gap: '10px' }}>
-                  <span>Read: <strong style={{ color: '#38bdf8' }}>{diskRead.toFixed(hasExporter ? 2 : 1)} {hasExporter ? 'MB/s' : 'MB'}</strong></span>
-                  <span>Write: <strong style={{ color: '#fb923c' }}>{diskWrite.toFixed(hasExporter ? 2 : 1)} {hasExporter ? 'MB/s' : 'MB'}</strong></span>
+                  <span>Read: <strong style={{ color: '#38bdf8' }}>{diskRead.toFixed(2)} MB/s</strong></span>
+                  <span>Write: <strong style={{ color: '#fb923c' }}>{diskWrite.toFixed(2)} MB/s</strong></span>
                 </div>
               </div>
 

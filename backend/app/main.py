@@ -1248,6 +1248,27 @@ def collect_full_realtime_db_snapshot(db: Session):
                     db_entry["total_active_sessions"] = int(io_row[5] or 0)
                     db_entry["total_connected"] = int(io_row[6] or 0)
                     db_entry["db_write_mb"] = float(io_row[7] or 0.0)
+
+                    # Calculate per-second Delta Rate
+                    now_t = time.time()
+                    raw_r = db_entry["db_read_mb"]
+                    raw_w = db_entry["db_write_mb"]
+                    prev = _DB_IO_PREV_STATS.get(label)
+                    if prev:
+                        dt = max(now_t - prev["time"], 0.5)
+                        delta_r = max(0.0, raw_r - prev["read_mb"])
+                        delta_w = max(0.0, raw_w - prev["write_mb"])
+                        db_entry["disk_read_rate_mb"] = round(delta_r / dt, 2)
+                        db_entry["disk_write_rate_mb"] = round(delta_w / dt, 2)
+                    else:
+                        db_entry["disk_read_rate_mb"] = 0.0
+                        db_entry["disk_write_rate_mb"] = 0.0
+
+                    _DB_IO_PREV_STATS[label] = {
+                        "time": now_t,
+                        "read_mb": raw_r,
+                        "write_mb": raw_w
+                    }
             except Exception:
                 conn.rollback()
 
@@ -1408,11 +1429,15 @@ def collect_full_realtime_db_snapshot(db: Session):
             db_entry["nodename"] = node_stat.get("nodename", h)
         else:
             db_entry["has_node_exporter"] = False
-            # Direct engine metrics
-            db_entry["cpu_pct"] = float(db_entry.get("cpu_active_workers", 0) * 5.0)  # active CPU worker metric
-            db_entry["mem_pct"] = db_entry.get("conn_pct", 0.0)
-            db_entry["disk_read_mb"] = db_entry.get("db_read_mb", 0.0)
-            db_entry["disk_write_mb"] = db_entry.get("db_write_mb", 0.0)
+            # Direct engine metrics (accurate real-time rates)
+            tot_conn = max(db_entry.get("total_connected", 1), 1)
+            cpu_work = db_entry.get("cpu_active_workers", 0)
+            db_entry["cpu_pct"] = round(min(100.0, (cpu_work / tot_conn) * 100.0), 1)
+            # Memory load estimate based on connection pool capacity
+            db_entry["mem_pct"] = round((tot_conn / max(db_entry.get("conn_max", 100), 1)) * 100.0, 1)
+            # Real-time per-second Delta Rate in MB/s
+            db_entry["disk_read_mb"] = db_entry.get("disk_read_rate_mb", 0.0)
+            db_entry["disk_write_mb"] = db_entry.get("disk_write_rate_mb", 0.0)
             db_entry["nodename"] = h
 
     return {
