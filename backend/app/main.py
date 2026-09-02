@@ -608,8 +608,38 @@ def fetch_live_system_telemetry(db: Session = None) -> str:
                     password = conn_info.get("password")
                     try:
                         c = psycopg2.connect(host=host, port=port, dbname=dbname, user=user, password=password, connect_timeout=3)
+                        cur = c.cursor()
+                        # Query active connections count vs max
+                        cur.execute("SELECT count(*) FROM pg_stat_activity WHERE state != 'idle' AND pid != pg_backend_pid()")
+                        active_cnt = cur.fetchone()[0] or 0
+                        cur.execute("SHOW max_connections")
+                        max_cnt = int(cur.fetchone()[0] or 100)
+                        conn_pct = (active_cnt / max_cnt * 100) if max_cnt > 0 else 0
+
+                        # Probe real-time long queries (>5s) or lock contention
+                        cur.execute("""
+                            SELECT pid, state, wait_event_type, wait_event, pg_blocking_pids(pid) AS blocking,
+                                   ROUND(EXTRACT(epoch FROM (now() - query_start))) AS dur,
+                                   SUBSTRING(query FROM 1 FOR 100) AS q
+                            FROM pg_stat_activity
+                            WHERE state != 'idle' AND pid != pg_backend_pid()
+                              AND query_start IS NOT NULL
+                              AND EXTRACT(epoch FROM (now() - query_start)) > 5
+                            ORDER BY dur DESC LIMIT 3
+                        """)
+                        slow_rows = cur.fetchall()
+                        cur.close()
                         c.close()
-                        telemetry.append(f"🐘 [SUCCESS] ฐานข้อมูล {label} ({host}:{port}/{dbname}): เชื่อมต่อได้ปกติ 100%")
+
+                        db_line = f"🐘 [SUCCESS] ฐานข้อมูล {label} ({host}:{port}/{dbname}): เชื่อมต่อได้ปกติ 100% (Active Connections: {active_cnt}/{max_cnt} - {conn_pct:.0f}%)"
+                        if slow_rows:
+                            db_line += f"\n   ⚠️ ตรวจพบคิวรีรันนาน >5s หรือติด Lock ขณะนี้ {len(slow_rows)} รายการ:"
+                            for r in slow_rows:
+                                pid, state, wait_type, wait_ev, blocking, dur, q_text = r
+                                block_str = f" [⛔ ติด Lock โดย PID {blocking}]" if blocking else ""
+                                wait_str = f" (รอ {wait_type}/{wait_ev})" if wait_type else ""
+                                db_line += f"\n   - PID {pid} รัน {dur}s{block_str}{wait_str}: {q_text}"
+                        telemetry.append(db_line)
                     except Exception as e:
                         err_msg = str(e).strip().replace('\n', ' ')
                         telemetry.append(f"🐘 [FAILED] ฐานข้อมูล {label} ({host}:{port}/{dbname}): ❌ เชื่อมต่อไม่ได้! สาเหตุ: {err_msg}")
@@ -845,6 +875,57 @@ def trigger_event_ai_diagnosis(
     db.commit()
     db.refresh(event)
     return event
+
+
+@app.get("/api/db/diagnose-realtime")
+def diagnose_postgresql_realtime(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Performs on-demand real-time live diagnostic inspection and root-cause troubleshooting
+    across all configured PostgreSQL databases and PgBouncer pools.
+    """
+    setting = db.query(Setting).filter(Setting.id == 1).first()
+    if not setting or not setting.db_connections_json:
+        raise HTTPException(status_code=400, detail="No database connections configured in Settings")
+
+    from .proactive_monitor import (
+        _fetch_db_health, _call_ai_diagnosis, _fetch_container_metrics,
+        _fetch_pgbouncer_metrics, _fetch_springboot_actuator_metrics
+    )
+
+    projects = json.loads(setting.loki_projects) if setting.loki_projects else []
+    db_health = _fetch_db_health(setting.db_connections_json)
+    container_metrics = _fetch_container_metrics(setting.prometheus_ip, setting.prometheus_port, projects)
+    pgb_metrics = _fetch_pgbouncer_metrics(setting.prometheus_ip, setting.prometheus_port, projects)
+    springboot_metrics = _fetch_springboot_actuator_metrics(setting.prometheus_ip, setting.prometheus_port, projects)
+
+    anomalies = []
+    for entry in db_health:
+        if entry.get("error"):
+            anomalies.append(f"Connection Failed: {entry['error']}")
+        if entry.get("conn_pct", 0) > 80:
+            anomalies.append(f"High Connection Load on {entry['label']}: {entry['conn_active']}/{entry['conn_max']} ({entry['conn_pct']:.0f}%)")
+        for q in entry.get("long_queries", []):
+            if q.get("duration_sec", 0) > 5:
+                anomalies.append(f"Long Query on {entry['label']} (PID {q['pid']}, {q['duration_sec']}s): {q['query'][:80]}")
+            if q.get("blocking_pids"):
+                anomalies.append(f"Lock Contention on {entry['label']}: PID {q['pid']} blocked by PID {q['blocking_pids']}")
+
+    ai_troubleshooting = None
+    if anomalies:
+        ai_troubleshooting = _call_ai_diagnosis(
+            setting, anomalies, container_metrics, pgb_metrics, db_health, 0, springboot_metrics
+        )
+
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "databases": db_health,
+        "pgbouncer": pgb_metrics,
+        "anomalies_detected": anomalies,
+        "ai_root_cause_troubleshooting": ai_troubleshooting
+    }
 
 
 # ─────────────────────────────────────────────────

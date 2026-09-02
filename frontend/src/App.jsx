@@ -40,7 +40,6 @@ export default function App() {
   const isResizingRef = useRef(false);
 
   const handleMouseDown = (e) => {
-    // Ignore dragging when clicking buttons, inputs, textareas, etc.
     if (e.target.closest('button') || e.target.closest('input') || e.target.closest('textarea')) {
       return;
     }
