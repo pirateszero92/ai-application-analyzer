@@ -1,4 +1,5 @@
 import os
+import time
 import threading
 import json
 import asyncio
@@ -36,6 +37,9 @@ def safe_json_loads(value, fallback):
         return fallback
 
 
+# Global cache for tracking per-database I/O delta rates
+_DB_IO_PREV_STATS: Dict[str, Dict[str, float]] = {}
+
 # Webhook token for Prometheus Alertmanager authentication
 ALERT_WEBHOOK_TOKEN = os.getenv("ALERT_WEBHOOK_TOKEN", "")
 
@@ -45,10 +49,11 @@ Base.metadata.create_all(bind=engine)
 app = FastAPI(title="AI Log Analyzer API")
 
 # Configure CORS
-# In production, replace ["*"] with specific origin domains
+cors_origins_env = os.getenv("CORS_ORIGINS", "*")
+cors_origins = [orig.strip() for orig in cors_origins_env.split(",") if orig.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origins if cors_origins else ["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -57,16 +62,19 @@ app.add_middleware(
 @app.on_event("startup")
 def startup_event():
     # Initialize default admin user and default settings if they do not exist
-    db = next(get_db())
+    db = SessionLocal()
     try:
         # 1. Default admin user (admin / admin)
         admin = db.query(User).filter(User.username == "admin").first()
         if not admin:
-            hashed_pw = get_password_hash("admin")
+            initial_pw = os.getenv("INITIAL_ADMIN_PASSWORD", "admin")
+            hashed_pw = get_password_hash(initial_pw)
             new_admin = User(username="admin", hashed_password=hashed_pw)
             db.add(new_admin)
             db.commit()
-            print("[*] Created default admin user (admin/admin)")
+            print(f"[*] Created default admin user (admin / {initial_pw})")
+            if initial_pw == "admin":
+                print("[!] SECURITY WARNING: Default password 'admin' is being used. Change it immediately via /api/auth/change-password.")
             
         # 2. Default settings (ID=1)
         settings = db.query(Setting).filter(Setting.id == 1).first()
@@ -124,7 +132,15 @@ def get_settings(current_user: User = Depends(get_current_user), db: Session = D
     if not setting:
         raise HTTPException(status_code=404, detail="Settings not found")
     
-    # Parse JSON strings to lists safely
+    # Parse JSON strings to lists safely and mask DB passwords
+    raw_db_conns = safe_json_loads(setting.db_connections_json, [])
+    masked_db_conns = []
+    for c in raw_db_conns:
+        c_copy = dict(c)
+        if c_copy.get("password"):
+            c_copy["password"] = "********"
+        masked_db_conns.append(c_copy)
+
     return SettingResponse(
         id=setting.id,
         loki_ip=setting.loki_ip,
@@ -154,7 +170,7 @@ def get_settings(current_user: User = Depends(get_current_user), db: Session = D
         storage_size_gb=setting.storage_size_gb,
         notes_for_ai=setting.notes_for_ai,
         server_specs=safe_json_loads(setting.server_specs_json, []),
-        db_connections=safe_json_loads(setting.db_connections_json, []),
+        db_connections=masked_db_conns,
         proactive_enabled=getattr(setting, "proactive_enabled", True) if getattr(setting, "proactive_enabled", True) is not None else True,
         proactive_interval_minutes=getattr(setting, "proactive_interval_minutes", 2) or 2,
         proactive_discord_enabled=getattr(setting, "proactive_discord_enabled", True) if getattr(setting, "proactive_discord_enabled", True) is not None else True
@@ -225,7 +241,21 @@ def update_settings(data: SettingUpdate, current_user: User = Depends(get_curren
     if data.server_specs is not None:
         setting.server_specs_json = json.dumps(data.server_specs, ensure_ascii=False)
     if data.db_connections is not None:
-        setting.db_connections_json = json.dumps(data.db_connections, ensure_ascii=False)
+        # Preserve existing passwords if incoming password is masked ("********") or blank
+        existing_conns = safe_json_loads(setting.db_connections_json, [])
+        existing_pw_map = {
+            (c.get("host"), int(c.get("port", 5432)), c.get("dbname")): c.get("password")
+            for c in existing_conns
+        }
+        processed_conns = []
+        for c in data.db_connections:
+            c_copy = dict(c)
+            key = (c_copy.get("host"), int(c_copy.get("port", 5432)), c_copy.get("dbname"))
+            pw = c_copy.get("password")
+            if pw == "********" or not pw:
+                c_copy["password"] = existing_pw_map.get(key, "")
+            processed_conns.append(c_copy)
+        setting.db_connections_json = json.dumps(processed_conns, ensure_ascii=False)
     # Proactive Monitoring
     if data.proactive_enabled is not None:
         setting.proactive_enabled = data.proactive_enabled
@@ -236,7 +266,15 @@ def update_settings(data: SettingUpdate, current_user: User = Depends(get_curren
         
     db.commit()
     
-    # Return formatted response safely
+    # Return formatted response safely with masked passwords
+    raw_saved_conns = safe_json_loads(setting.db_connections_json, [])
+    masked_saved_conns = []
+    for c in raw_saved_conns:
+        c_copy = dict(c)
+        if c_copy.get("password"):
+            c_copy["password"] = "********"
+        masked_saved_conns.append(c_copy)
+
     return SettingResponse(
         id=setting.id,
         loki_ip=setting.loki_ip,
@@ -266,7 +304,7 @@ def update_settings(data: SettingUpdate, current_user: User = Depends(get_curren
         storage_size_gb=setting.storage_size_gb,
         notes_for_ai=setting.notes_for_ai,
         server_specs=safe_json_loads(setting.server_specs_json, []),
-        db_connections=safe_json_loads(setting.db_connections_json, []),
+        db_connections=masked_saved_conns,
         proactive_enabled=getattr(setting, "proactive_enabled", True) if getattr(setting, "proactive_enabled", True) is not None else True,
         proactive_interval_minutes=getattr(setting, "proactive_interval_minutes", 2) or 2,
         proactive_discord_enabled=getattr(setting, "proactive_discord_enabled", True) if getattr(setting, "proactive_discord_enabled", True) is not None else True
@@ -607,11 +645,11 @@ def delete_report(report_id: int, current_user: User = Depends(get_current_user)
     # 1. Delete from MinIO if it exists
     if report.minio_object_name:
         try:
-            from .storage import get_minio_client
+            from .storage import get_minio_client, MINIO_BUCKET
             client = get_minio_client()
             if client:
-                client.remove_object("reports", report.minio_object_name)
-                print(f"[*] Deleted MinIO object: {report.minio_object_name}")
+                client.remove_object(MINIO_BUCKET, report.minio_object_name)
+                print(f"[*] Deleted MinIO object from {MINIO_BUCKET}: {report.minio_object_name}")
         except Exception as e:
             print(f"[!] Failed to delete MinIO object: {str(e)}")
             
@@ -1863,7 +1901,7 @@ def start_benchmark(
             req.concurrent_users,
             req.duration_seconds,
             setting,
-            db
+            None
         )
     elif req.mode == "postgres":
         if not req.sql_query:
@@ -1890,7 +1928,7 @@ def start_benchmark(
             req.concurrent_users,
             req.duration_seconds,
             setting,
-            db
+            None
         )
     else:
         raise HTTPException(status_code=400, detail="Invalid benchmark mode. Use 'http' or 'postgres'")

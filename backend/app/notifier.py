@@ -1,6 +1,6 @@
 import requests
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 def send_discord_alert(webhook_url: str, title: str, description: str, fields: list = None, color: int = 15548997):
     """
@@ -19,7 +19,7 @@ def send_discord_alert(webhook_url: str, title: str, description: str, fields: l
                 "description": description[:2000],  # Discord limit: 2048 chars for description
                 "color": color,
                 "fields": fields or [],
-                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "footer": {
                     "text": "AI Log Analyzer System"
                 }

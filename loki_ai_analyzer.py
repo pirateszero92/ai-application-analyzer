@@ -1,9 +1,10 @@
+import os
 import requests
 import json
 import time
 import urllib3
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # Configure stdout/stderr to use UTF-8 encoding on Windows to prevent UnicodeEncodeError
 if sys.stdout.encoding != 'utf-8':
@@ -18,16 +19,16 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- [ 1. การตั้งค่าระบบ (Configuration) ] ---
 # IP Server Monitoring ตามที่คุณระบุไว้
-LOKI_IP = "10.1.1.152"
+LOKI_IP = os.getenv("LOKI_IP", "10.1.1.152")
 LOKI_URL = f"http://{LOKI_IP}:3100/loki/api/v1/query_range"
 LOKI_PROJECTS = ["wms", "tms"]
 
 # PMM (Percona Monitoring and Management) Configuration
-PMM_IP = "10.1.1.152"
-PMM_PORT = "8443"
+PMM_IP = os.getenv("PMM_IP", "10.1.1.152")
+PMM_PORT = os.getenv("PMM_PORT", "8443")
 PMM_URL = f"https://{PMM_IP}:{PMM_PORT}/v1/qan/metrics:getReport"
-PMM_USER = "admin"
-PMM_PASSWORD = "superpart1234"
+PMM_USER = os.getenv("PMM_USER", "admin")
+PMM_PASSWORD = os.getenv("PMM_PASSWORD", "superpart1234")
 PMM_DB_FILTERS = ["wms", "tms"]
 
 # เปลี่ยนโครงสร้างเป็น LM Studio ตามพอร์ตและโมเดลที่คุณกำหนดไว้
@@ -84,7 +85,7 @@ def fetch_loki_logs():
 def fetch_pmm_slow_queries(hours=1):
     print(f"[*] กำลังดึงข้อมูล SQL ที่ช้าจาก PMM QAN ({PMM_IP}) ย้อนหลัง {hours} ชั่วโมง...")
     
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     start_time = now - timedelta(hours=hours)
     start_iso = start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
     end_iso = now.strftime('%Y-%m-%dT%H:%M:%SZ')

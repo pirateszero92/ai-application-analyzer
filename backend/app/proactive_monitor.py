@@ -317,8 +317,19 @@ def _explain_query_plan(cur, query_text: str) -> dict:
     if not (upper.startswith("SELECT") or upper.startswith("WITH")):
         return {"can_explain": False, "reason": "Non-SELECT query skipped for safety"}
 
+    # SQL Injection Guard: Reject multi-statements, dangerous DDL/DML, and stacked queries
+    cleaned_no_trailing = cleaned.rstrip(';').strip()
+    if ";" in cleaned_no_trailing:
+        return {"can_explain": False, "reason": "Multi-statement query rejected for safety"}
+
+    # Disallow write or DDL operations
+    dangerous_keywords = ["DROP ", "DELETE ", "UPDATE ", "INSERT ", "TRUNCATE ", "ALTER ", "GRANT ", "REVOKE "]
+    upper_no_trailing = cleaned_no_trailing.upper()
+    if any(kw in upper_no_trailing for kw in dangerous_keywords):
+        return {"can_explain": False, "reason": "Query contains mutating/DDL keywords, skipped for safety"}
+
     try:
-        cur.execute(f"EXPLAIN (FORMAT JSON) {cleaned}")
+        cur.execute(f"EXPLAIN (FORMAT JSON) {cleaned_no_trailing}")
         raw_plan = cur.fetchone()
         if not raw_plan:
             return {"can_explain": False, "reason": "Empty plan"}

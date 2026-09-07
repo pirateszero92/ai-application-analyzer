@@ -5,6 +5,7 @@ import math
 import requests
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
+import threading
 from typing import Dict, List, Optional
 import psycopg2
 
@@ -15,6 +16,7 @@ class BenchmarkEngine:
     and requests AI Performance Optimization Analysis upon test completion.
     """
     def __init__(self):
+        self._lock = threading.Lock()
         self.is_running = False
         self.should_stop = False
         self.name = "Benchmark Run"
@@ -238,29 +240,37 @@ class BenchmarkEngine:
                     t0 = time.perf_counter()
                     try:
                         cur.execute(sql_query)
-                        cur.fetchall()  # fetch result if any
+                        if cur.description is not None:
+                            cur.fetchall()  # fetch result if query returns rows
                         lat = (time.perf_counter() - t0) * 1000.0
 
-                        self.total_ops += 1
-                        self.success_ops += 1
-                        self.latencies_ms.append(lat)
-                        self.status_codes["OK"] = self.status_codes.get("OK", 0) + 1
+                        with self._lock:
+                            self.total_ops += 1
+                            self.success_ops += 1
+                            self.latencies_ms.append(lat)
+                            self.status_codes["OK"] = self.status_codes.get("OK", 0) + 1
                     except Exception as e:
-                        conn.rollback()
+                        if conn and not conn.autocommit:
+                            try:
+                                conn.rollback()
+                            except Exception:
+                                pass
                         lat = (time.perf_counter() - t0) * 1000.0
-                        self.total_ops += 1
-                        self.failed_ops += 1
-                        err_name = type(e).__name__
-                        self.status_codes[err_name] = self.status_codes.get(err_name, 0) + 1
-                        self.latencies_ms.append(lat)
+                        with self._lock:
+                            self.total_ops += 1
+                            self.failed_ops += 1
+                            err_name = type(e).__name__
+                            self.status_codes[err_name] = self.status_codes.get(err_name, 0) + 1
+                            self.latencies_ms.append(lat)
                     time.sleep(0.001)
                 conn.close()
             except Exception as e:
                 self.last_error = f"Connection error: {e}"
 
-        # Run DB workers in ThreadPool
+        # Run DB workers in ThreadPool (capped at 64 to avoid OS thread exhaustion)
         loop = asyncio.get_running_loop()
-        with ThreadPoolExecutor(max_workers=self.concurrent_users) as executor:
+        worker_pool_size = min(self.concurrent_users, 64)
+        with ThreadPoolExecutor(max_workers=worker_pool_size) as executor:
             sampler_task = asyncio.create_task(self._async_sampler())
             futures = [loop.run_in_executor(executor, _db_worker_func) for _ in range(self.concurrent_users)]
             await asyncio.gather(*futures)
@@ -364,12 +374,20 @@ class BenchmarkEngine:
             ai_recommendation=ai_recommendation
         )
 
-        db_session.add(report)
-        db_session.commit()
-        db_session.refresh(report)
-
-        self.last_completed_report_id = report.id
-        print(f"[Benchmark] Finished report #{report.id}: {self.name} ({ops_per_sec:.1f} ops/s, p99={p99_ms:.1f}ms)")
+        # Persist report using dedicated DB session to avoid detached/closed session issues
+        from .database import SessionLocal
+        save_db = SessionLocal()
+        try:
+            save_db.add(report)
+            save_db.commit()
+            save_db.refresh(report)
+            self.last_completed_report_id = report.id
+            print(f"[Benchmark] Finished report #{report.id}: {self.name} ({ops_per_sec:.1f} ops/s, p99={p99_ms:.1f}ms)")
+        except Exception as ex:
+            save_db.rollback()
+            print(f"[Benchmark] Failed to save report: {ex}")
+        finally:
+            save_db.close()
 
     def _call_ai_benchmark_analysis(self, setting, r: dict) -> str:
         """Calls AI Model to analyze performance benchmark results."""

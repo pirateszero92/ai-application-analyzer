@@ -4,7 +4,7 @@ import json
 import re
 import time
 import urllib3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 from .models import Setting, Report
 from .storage import upload_report_archive
@@ -74,7 +74,7 @@ def fetch_pmm_slow_queries(pmm_ip: str, pmm_port: str, pmm_user: str, pmm_pass: 
     pmm_url = f"https://{pmm_ip}:{pmm_port}/v1/qan/metrics:getReport"
     print(f"[*] Fetching slow queries from PMM ({pmm_ip}:{pmm_port}) for databases: {db_filters} (lookback: {lookback_minutes} mins)...")
     
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     start_time = now - timedelta(minutes=lookback_minutes)
     start_iso = start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
     end_iso = now.strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -1336,9 +1336,15 @@ def run_analysis_job(db: Session, report_id: int):
         return
 
     try:
-        # 1. Parse lists
-        loki_projects = json.loads(setting.loki_projects)
-        pmm_db_filters = json.loads(setting.pmm_db_filters)
+        # 1. Parse lists safely
+        try:
+            loki_projects = json.loads(setting.loki_projects) if setting.loki_projects else []
+        except Exception:
+            loki_projects = []
+        try:
+            pmm_db_filters = json.loads(setting.pmm_db_filters) if setting.pmm_db_filters else []
+        except Exception:
+            pmm_db_filters = []
         lookback_mins = setting.lookback_minutes or 15
         
         # 2. Fetch data

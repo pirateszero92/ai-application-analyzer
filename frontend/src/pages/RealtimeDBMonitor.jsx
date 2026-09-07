@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { 
   Activity, 
   Lock, 
@@ -290,13 +290,20 @@ export default function RealtimeDBMonitor({ token, API_BASE }) {
   };
 
   const databases = liveData?.databases || [];
-  const filteredDatabases = selectedDb === 'ALL' 
-    ? databases 
-    : databases.filter(d => d.label === selectedDb || d.host === selectedDb);
+  const filteredDatabases = useMemo(() => {
+    return selectedDb === 'ALL' 
+      ? databases 
+      : databases.filter(d => d.label === selectedDb || d.host === selectedDb);
+  }, [databases, selectedDb]);
 
-  // Aggregate all locks & queries
-  const allLocks = filteredDatabases.flatMap(d => (d.lock_tree || []).map(l => ({ ...l, dbLabel: d.label })));
-  const allActiveQueries = filteredDatabases.flatMap(d => (d.active_queries || []).map(q => ({ ...q, dbLabel: d.label })));
+  // Aggregate all locks & queries with useMemo to avoid recomputing on every render
+  const allLocks = useMemo(() => {
+    return filteredDatabases.flatMap(d => (d.lock_tree || []).map(l => ({ ...l, dbLabel: d.label })));
+  }, [filteredDatabases]);
+
+  const allActiveQueries = useMemo(() => {
+    return filteredDatabases.flatMap(d => (d.active_queries || []).map(q => ({ ...q, dbLabel: d.label })));
+  }, [filteredDatabases]);
 
   return (
     <div className="fade-in" style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
