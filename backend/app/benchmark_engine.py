@@ -107,85 +107,90 @@ class BenchmarkEngine:
         self.timeline = []
         self.last_error = None
 
-        headers = json.loads(headers_json) if headers_json else {}
-        payload = json.loads(payload_json) if payload_json else None
+        sampler_task = None
+        try:
+            headers = json.loads(headers_json) if headers_json else {}
+            payload = json.loads(payload_json) if payload_json else None
 
-        end_time = self.start_time + self.duration_seconds
+            end_time = self.start_time + self.duration_seconds
 
-        async def _worker(client: httpx.AsyncClient):
-            while time.time() < end_time and not self.should_stop:
-                t0 = time.perf_counter()
-                try:
-                    res = await client.request(
-                        method=method.upper(),
-                        url=target_url,
-                        headers=headers,
-                        json=payload,
-                        timeout=10.0
-                    )
-                    latency = (time.perf_counter() - t0) * 1000.0
-                    status_code = res.status_code
-                    code_str = str(status_code)
+            async def _worker(client: httpx.AsyncClient):
+                while time.time() < end_time and not self.should_stop:
+                    t0 = time.perf_counter()
+                    try:
+                        res = await client.request(
+                            method=method.upper(),
+                            url=target_url,
+                            headers=headers,
+                            json=payload,
+                            timeout=10.0
+                        )
+                        latency = (time.perf_counter() - t0) * 1000.0
+                        status_code = res.status_code
+                        code_str = str(status_code)
 
-                    self.total_ops += 1
-                    self.status_codes[code_str] = self.status_codes.get(code_str, 0) + 1
-                    self.latencies_ms.append(latency)
+                        self.total_ops += 1
+                        self.status_codes[code_str] = self.status_codes.get(code_str, 0) + 1
+                        self.latencies_ms.append(latency)
 
-                    if 200 <= status_code < 400:
-                        self.success_ops += 1
-                    else:
+                        if 200 <= status_code < 400:
+                            self.success_ops += 1
+                        else:
+                            self.failed_ops += 1
+                    except Exception as e:
+                        latency = (time.perf_counter() - t0) * 1000.0
+                        self.total_ops += 1
                         self.failed_ops += 1
-                except Exception as e:
-                    latency = (time.perf_counter() - t0) * 1000.0
-                    self.total_ops += 1
-                    self.failed_ops += 1
-                    err_str = type(e).__name__
-                    self.status_codes[err_str] = self.status_codes.get(err_str, 0) + 1
-                    self.latencies_ms.append(latency)
+                        err_str = type(e).__name__
+                        self.status_codes[err_str] = self.status_codes.get(err_str, 0) + 1
+                        self.latencies_ms.append(latency)
 
-                # Yield control briefly
-                await asyncio.sleep(0.001)
+                    # Yield control briefly
+                    await asyncio.sleep(0.001)
 
-        # Background monitor task for timeline sampling
-        async def _sampler():
-            last_ops = 0
-            while self.is_running and not self.should_stop:
-                await asyncio.sleep(1.0)
-                curr_time = time.time()
-                elapsed = curr_time - self.start_time
-                if elapsed <= 0:
-                    continue
+            async def _sampler():
+                last_ops = 0
+                while self.is_running and not self.should_stop:
+                    await asyncio.sleep(1.0)
+                    curr_time = time.time()
+                    elapsed = curr_time - self.start_time
+                    if elapsed <= 0:
+                        continue
 
-                recent_ops = self.total_ops - last_ops
-                last_ops = self.total_ops
+                    recent_ops = self.total_ops - last_ops
+                    last_ops = self.total_ops
 
-                self.current_rps = float(recent_ops)
-                self.current_error_rate = (self.failed_ops / max(1, self.total_ops)) * 100.0
+                    self.current_rps = float(recent_ops)
+                    self.current_error_rate = (self.failed_ops / max(1, self.total_ops)) * 100.0
 
-                if self.latencies_ms:
-                    sorted_lats = sorted(self.latencies_ms[-500:])  # last 500 samples
-                    self.current_avg_ms = sum(sorted_lats) / len(sorted_lats)
-                    p99_idx = max(0, int(math.ceil(0.99 * len(sorted_lats))) - 1)
-                    self.current_p99_ms = sorted_lats[p99_idx]
+                    if self.latencies_ms:
+                        sorted_lats = sorted(self.latencies_ms[-500:])  # last 500 samples
+                        self.current_avg_ms = sum(sorted_lats) / len(sorted_lats)
+                        p99_idx = max(0, int(math.ceil(0.99 * len(sorted_lats))) - 1)
+                        self.current_p99_ms = sorted_lats[p99_idx]
 
-                self.timeline.append({
-                    "second": int(elapsed),
-                    "ops": recent_ops,
-                    "avg_ms": round(self.current_avg_ms, 1),
-                    "p99_ms": round(self.current_p99_ms, 1),
-                    "failed": self.failed_ops
-                })
+                    self.timeline.append({
+                        "second": int(elapsed),
+                        "ops": recent_ops,
+                        "avg_ms": round(self.current_avg_ms, 1),
+                        "p99_ms": round(self.current_p99_ms, 1),
+                        "failed": self.failed_ops
+                    })
 
-        # Run client workers
-        sampler_task = asyncio.create_task(_sampler())
-        limits = httpx.Limits(max_keepalive_connections=self.concurrent_users, max_connections=self.concurrent_users * 2)
-        async with httpx.AsyncClient(limits=limits, verify=False) as client:
-            workers = [_worker(client) for _ in range(self.concurrent_users)]
-            await asyncio.gather(*workers)
-
-        self.is_running = False
-        self.elapsed_seconds = time.time() - self.start_time
-        sampler_task.cancel()
+            # Run client workers
+            sampler_task = asyncio.create_task(_sampler())
+            limits = httpx.Limits(max_keepalive_connections=self.concurrent_users, max_connections=self.concurrent_users * 2)
+            async with httpx.AsyncClient(limits=limits, verify=False) as client:
+                workers = [_worker(client) for _ in range(self.concurrent_users)]
+                await asyncio.gather(*workers)
+        except Exception as e:
+            self.last_error = str(e)
+            print(f"[Benchmark] HTTP Benchmark error: {e}")
+        finally:
+            self.is_running = False
+            self.elapsed_seconds = time.time() - self.start_time
+            if sampler_task:
+                sampler_task.cancel()
 
         # Compute final report
         await self._finish_and_save_report(setting, db_session)
@@ -222,61 +227,69 @@ class BenchmarkEngine:
 
         end_time = self.start_time + self.duration_seconds
 
-        def _db_worker_func():
-            conn = None
-            try:
-                conn = psycopg2.connect(
-                    host=db_conn_info.get("host"),
-                    port=int(db_conn_info.get("port", 5432)),
-                    dbname=db_conn_info.get("dbname"),
-                    user=db_conn_info.get("user"),
-                    password=db_conn_info.get("password"),
-                    connect_timeout=5
-                )
-                conn.autocommit = True
-                cur = conn.cursor()
+        sampler_task = None
+        try:
+            def _db_worker_func():
+                conn = None
+                try:
+                    conn = psycopg2.connect(
+                        host=db_conn_info.get("host"),
+                        port=int(db_conn_info.get("port", 5432)),
+                        dbname=db_conn_info.get("dbname"),
+                        user=db_conn_info.get("user"),
+                        password=db_conn_info.get("password"),
+                        connect_timeout=5
+                    )
+                    conn.autocommit = True
+                    cur = conn.cursor()
+                    cur.execute("SET statement_timeout = 30000; SET lock_timeout = 5000;")
 
-                while time.time() < end_time and not self.should_stop:
-                    t0 = time.perf_counter()
-                    try:
-                        cur.execute(sql_query)
-                        if cur.description is not None:
-                            cur.fetchall()  # fetch result if query returns rows
-                        lat = (time.perf_counter() - t0) * 1000.0
+                    while time.time() < end_time and not self.should_stop:
+                        t0 = time.perf_counter()
+                        try:
+                            cur.execute(sql_query)
+                            if cur.description is not None:
+                                cur.fetchall()  # fetch result if query returns rows
+                            lat = (time.perf_counter() - t0) * 1000.0
 
-                        with self._lock:
-                            self.total_ops += 1
-                            self.success_ops += 1
-                            self.latencies_ms.append(lat)
-                            self.status_codes["OK"] = self.status_codes.get("OK", 0) + 1
-                    except Exception as e:
-                        if conn and not conn.autocommit:
-                            try:
-                                conn.rollback()
-                            except Exception:
-                                pass
-                        lat = (time.perf_counter() - t0) * 1000.0
-                        with self._lock:
-                            self.total_ops += 1
-                            self.failed_ops += 1
-                            err_name = type(e).__name__
-                            self.status_codes[err_name] = self.status_codes.get(err_name, 0) + 1
-                            self.latencies_ms.append(lat)
-                    time.sleep(0.001)
-                conn.close()
-            except Exception as e:
-                self.last_error = f"Connection error: {e}"
+                            with self._lock:
+                                self.total_ops += 1
+                                self.success_ops += 1
+                                self.latencies_ms.append(lat)
+                                self.status_codes["OK"] = self.status_codes.get("OK", 0) + 1
+                        except Exception as e:
+                            if conn and not conn.autocommit:
+                                try:
+                                    conn.rollback()
+                                except Exception:
+                                    pass
+                            lat = (time.perf_counter() - t0) * 1000.0
+                            with self._lock:
+                                self.total_ops += 1
+                                self.failed_ops += 1
+                                err_name = type(e).__name__
+                                self.status_codes[err_name] = self.status_codes.get(err_name, 0) + 1
+                                self.latencies_ms.append(lat)
+                        time.sleep(0.001)
+                    conn.close()
+                except Exception as e:
+                    self.last_error = f"Connection error: {e}"
 
-        # Run DB workers in ThreadPool (capped at 64 to avoid OS thread exhaustion)
-        loop = asyncio.get_running_loop()
-        worker_pool_size = min(self.concurrent_users, 64)
-        with ThreadPoolExecutor(max_workers=worker_pool_size) as executor:
-            sampler_task = asyncio.create_task(self._async_sampler())
-            futures = [loop.run_in_executor(executor, _db_worker_func) for _ in range(self.concurrent_users)]
-            await asyncio.gather(*futures)
-
-        self.is_running = False
-        self.elapsed_seconds = time.time() - self.start_time
+            # Run DB workers in ThreadPool (capped at 64 to avoid OS thread exhaustion)
+            loop = asyncio.get_running_loop()
+            worker_pool_size = min(self.concurrent_users, 64)
+            with ThreadPoolExecutor(max_workers=worker_pool_size) as executor:
+                sampler_task = asyncio.create_task(self._async_sampler())
+                futures = [loop.run_in_executor(executor, _db_worker_func) for _ in range(self.concurrent_users)]
+                await asyncio.gather(*futures)
+        except Exception as e:
+            self.last_error = str(e)
+            print(f"[Benchmark] Postgres Benchmark error: {e}")
+        finally:
+            self.is_running = False
+            self.elapsed_seconds = time.time() - self.start_time
+            if sampler_task:
+                sampler_task.cancel()
 
         await self._finish_and_save_report(setting, db_session)
 
@@ -349,8 +362,8 @@ class BenchmarkEngine:
             "status_breakdown": self.status_codes
         }
 
-        # Request AI Analysis
-        ai_recommendation = self._call_ai_benchmark_analysis(setting, report_summary)
+        # Request AI Analysis in non-blocking worker thread
+        ai_recommendation = await asyncio.to_thread(self._call_ai_benchmark_analysis, setting, report_summary)
 
         report = BenchmarkReport(
             name=self.name,

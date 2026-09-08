@@ -602,8 +602,11 @@ def fetch_pmm_os_and_config_metrics(pmm_ip: str, pmm_port: str, pmm_user: str, p
         for row in uname_rows:
             m    = row.get("metric", {})
             inst = m.get("instance", "?")
-            node = m.get("nodename", m.get("hostname", inst))
-            instance_map[inst] = node
+            node = m.get("node_name") or m.get("nodename", m.get("hostname", inst))
+            instance_map[inst] = {
+                "name": node,
+                "raw": f"{m.get('node_name', '')} {m.get('nodename', '')} {m.get('hostname', '')} {inst}".lower()
+            }
 
         # Gather node metrics
         cpu_idle  = q("rate(node_cpu_seconds_total{mode='idle'}[5m])")
@@ -627,9 +630,14 @@ def fetch_pmm_os_and_config_metrics(pmm_ip: str, pmm_port: str, pmm_user: str, p
         def set_node(rows, key, agg="sum"):
             for row in rows:
                 inst = row.get("metric", {}).get("instance", "?")
-                node = instance_map.get(inst, inst[:12])
-                if any(p in node.lower() for p in ['dev', 'staging', 'test']):
+                node_info = instance_map.get(inst, {"name": inst[:12], "raw": inst[:12].lower()})
+                node = node_info["name"]
+                raw_info = node_info["raw"]
+
+                # Exclude monitoring server itself, decommissioned DR/slot-2 replica nodes, and non-prod environments
+                if any(p in raw_info for p in ['pmm-server', 'f8902', 'dr-db', 'monitor', 'dev', 'staging', 'test']):
                     continue
+
                 if node not in nodes:
                     nodes[node] = {}
                 v = val(row)

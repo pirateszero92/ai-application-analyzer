@@ -43,7 +43,7 @@ services:
     volumes:
       - minio_data:/data
     ports:
-      - "9000:9000"      # API port
+      - "127.0.0.1:9000:9000"  # API port restricted to localhost
       - "127.0.0.1:9001:9001"  # Console administration port restricted to localhost
     command: server /data --console-address ":9001"
 

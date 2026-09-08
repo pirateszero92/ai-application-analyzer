@@ -67,6 +67,8 @@ metadata:
   name: postgres-deployment
   namespace: default
 spec:
+  strategy:
+    type: Recreate
   replicas: 1
   selector:
     matchLabels:
@@ -219,11 +221,17 @@ spec:
                 name: ai-analyzer-config
           ports:
             - containerPort: 8000
-          readinessProbe:
+          livenessProbe:
             httpGet:
-              path: /api/settings  # Simple check path
+              path: /healthz
               port: 8000
             initialDelaySeconds: 15
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8000
+            initialDelaySeconds: 10
             periodSeconds: 10
 
 ---

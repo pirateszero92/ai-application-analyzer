@@ -28,7 +28,7 @@ PMM_IP = os.getenv("PMM_IP", "10.1.1.152")
 PMM_PORT = os.getenv("PMM_PORT", "8443")
 PMM_URL = f"https://{PMM_IP}:{PMM_PORT}/v1/qan/metrics:getReport"
 PMM_USER = os.getenv("PMM_USER", "admin")
-PMM_PASSWORD = os.getenv("PMM_PASSWORD", "superpart1234")
+PMM_PASSWORD = os.getenv("PMM_PASSWORD", "")
 PMM_DB_FILTERS = ["wms", "tms"]
 
 # เปลี่ยนโครงสร้างเป็น LM Studio ตามพอร์ตและโมเดลที่คุณกำหนดไว้

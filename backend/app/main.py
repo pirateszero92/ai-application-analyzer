@@ -10,7 +10,7 @@ from fastapi import FastAPI, Depends, HTTPException, Header, status, BackgroundT
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy import and_
+from sqlalchemy import and_, text
 from sqlalchemy.orm import Session
 from typing import List, Optional, Dict, Any
 
@@ -59,12 +59,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/healthz")
+@app.get("/readyz")
+def healthz_and_readyz(db: Session = Depends(get_db)):
+    """
+    Unauthenticated health & readiness probe for Kubernetes / Container Orchestrators.
+    """
+    try:
+        db.execute(text("SELECT 1"))
+        return {"status": "ok", "ready": True}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Service not ready: {str(e)}")
+
 @app.on_event("startup")
 def startup_event():
     # Initialize default admin user and default settings if they do not exist
     db = SessionLocal()
     try:
-        # 1. Default admin user (admin / admin)
+        # 1. Default admin user
         admin = db.query(User).filter(User.username == "admin").first()
         if not admin:
             initial_pw = os.getenv("INITIAL_ADMIN_PASSWORD", "admin")
@@ -72,9 +84,9 @@ def startup_event():
             new_admin = User(username="admin", hashed_password=hashed_pw)
             db.add(new_admin)
             db.commit()
-            print(f"[*] Created default admin user (admin / {initial_pw})")
+            print("[*] Initialized default admin user account.")
             if initial_pw == "admin":
-                print("[!] SECURITY WARNING: Default password 'admin' is being used. Change it immediately via /api/auth/change-password.")
+                print("[!] SECURITY WARNING: Default password 'admin' is being used. Please change it immediately via /api/auth/change-password.")
             
         # 2. Default settings (ID=1)
         settings = db.query(Setting).filter(Setting.id == 1).first()
@@ -244,16 +256,21 @@ def update_settings(data: SettingUpdate, current_user: User = Depends(get_curren
         # Preserve existing passwords if incoming password is masked ("********") or blank
         existing_conns = safe_json_loads(setting.db_connections_json, [])
         existing_pw_map = {
-            (c.get("host"), int(c.get("port", 5432)), c.get("dbname")): c.get("password")
+            (c.get("label", ""), c.get("host", ""), int(c.get("port", 5432)), c.get("dbname", ""), c.get("user", "")): c.get("password")
+            for c in existing_conns
+        }
+        fallback_pw_map = {
+            (c.get("host", ""), int(c.get("port", 5432)), c.get("dbname", "")): c.get("password")
             for c in existing_conns
         }
         processed_conns = []
         for c in data.db_connections:
             c_copy = dict(c)
-            key = (c_copy.get("host"), int(c_copy.get("port", 5432)), c_copy.get("dbname"))
+            exact_key = (c_copy.get("label", ""), c_copy.get("host", ""), int(c_copy.get("port", 5432)), c_copy.get("dbname", ""), c_copy.get("user", ""))
+            fallback_key = (c_copy.get("host", ""), int(c_copy.get("port", 5432)), c_copy.get("dbname", ""))
             pw = c_copy.get("password")
             if pw == "********" or not pw:
-                c_copy["password"] = existing_pw_map.get(key, "")
+                c_copy["password"] = existing_pw_map.get(exact_key, fallback_pw_map.get(fallback_key, ""))
             processed_conns.append(c_copy)
         setting.db_connections_json = json.dumps(processed_conns, ensure_ascii=False)
     # Proactive Monitoring
@@ -782,7 +799,7 @@ def get_chat_messages(
 
 def fetch_live_system_telemetry(db: Session = None) -> str:
     """
-    Fetches real-time live infrastructure telemetry from Prometheus (10.1.1.152:9090)
+    Fetches real-time live infrastructure telemetry from Prometheus
     and probes live database connections configured in Settings.
     """
     import urllib.request
@@ -790,7 +807,20 @@ def fetch_live_system_telemetry(db: Session = None) -> str:
     import psycopg2
     
     telemetry = []
-    base_url = "http://10.1.1.152:9090/api/v1/query?query="
+    prom_ip = "10.1.1.152"
+    prom_port = "9090"
+    setting = None
+    if db:
+        try:
+            setting = db.query(Setting).filter(Setting.id == 1).first()
+            if setting:
+                if setting.prometheus_ip:
+                    prom_ip = setting.prometheus_ip
+                if setting.prometheus_port:
+                    prom_port = setting.prometheus_port
+        except Exception:
+            pass
+    base_url = f"http://{prom_ip}:{prom_port}/api/v1/query?query="
     
     # 1. Check Container Down status
     try:
@@ -1310,42 +1340,31 @@ def collect_full_realtime_db_snapshot(db: Session):
             except Exception:
                 conn.rollback()
 
-            # 2. Lock Tree / Blocking Sessions Graph (Deadlocks & Lock Contention)
+            # 2. Lock Tree / Blocking Sessions Graph using pg_blocking_pids()
             try:
                 cur.execute("""
                     SELECT
-                        blocked_locks.pid AS blocked_pid,
-                        blocked_activity.usename AS blocked_user,
-                        blocked_activity.client_addr::text AS blocked_client,
-                        ROUND(EXTRACT(epoch FROM (now() - blocked_activity.query_start)))::int AS blocked_duration_sec,
-                        SUBSTRING(blocked_activity.query FROM 1 FOR 300) AS blocked_statement,
-                        blocked_activity.state AS blocked_state,
-                        COALESCE(blocked_activity.wait_event_type, 'Lock') AS blocked_wait_type,
-                        COALESCE(blocked_activity.wait_event, 'transactionid') AS blocked_wait_event,
-                        blocking_locks.pid AS blocking_pid,
-                        blocking_activity.usename AS blocking_user,
-                        blocking_activity.client_addr::text AS blocking_client,
-                        ROUND(EXTRACT(epoch FROM (now() - blocking_activity.query_start)))::int AS blocking_duration_sec,
-                        SUBSTRING(blocking_activity.query FROM 1 FOR 300) AS blocking_statement,
-                        blocking_activity.state AS blocking_state,
-                        blocking_locks.mode AS lock_mode,
-                        blocking_locks.locktype AS lock_type
-                    FROM pg_catalog.pg_locks blocked_locks
-                    JOIN pg_catalog.pg_stat_activity blocked_activity ON blocked_activity.pid = blocked_locks.pid
-                    JOIN pg_catalog.pg_locks blocking_locks 
-                        ON blocking_locks.locktype = blocked_locks.locktype
-                        AND blocking_locks.database IS NOT DISTINCT FROM blocked_locks.database
-                        AND blocking_locks.relation IS NOT DISTINCT FROM blocked_locks.relation
-                        AND blocking_locks.page IS NOT DISTINCT FROM blocked_locks.page
-                        AND blocking_locks.tuple IS NOT DISTINCT FROM blocked_locks.tuple
-                        AND blocking_locks.virtualxid IS NOT DISTINCT FROM blocked_locks.virtualxid
-                        AND blocking_locks.transactionid IS NOT DISTINCT FROM blocked_locks.transactionid
-                        AND blocking_locks.classid IS NOT DISTINCT FROM blocked_locks.classid
-                        AND blocking_locks.objid IS NOT DISTINCT FROM blocked_locks.objid
-                        AND blocking_locks.objsubid IS NOT DISTINCT FROM blocked_locks.objsubid
-                        AND blocking_locks.pid != blocked_locks.pid
-                    JOIN pg_catalog.pg_stat_activity blocking_activity ON blocking_activity.pid = blocking_locks.pid
-                    WHERE NOT blocked_locks.granted
+                        blocked.pid AS blocked_pid,
+                        blocked.usename AS blocked_user,
+                        blocked.client_addr::text AS blocked_client,
+                        ROUND(EXTRACT(epoch FROM (now() - blocked.query_start)))::int AS blocked_duration_sec,
+                        SUBSTRING(blocked.query FROM 1 FOR 300) AS blocked_statement,
+                        blocked.state AS blocked_state,
+                        COALESCE(blocked.wait_event_type, 'Lock') AS blocked_wait_type,
+                        COALESCE(blocked.wait_event, 'transactionid') AS blocked_wait_event,
+                        blocking_pid,
+                        blocking.usename AS blocking_user,
+                        blocking.client_addr::text AS blocking_client,
+                        ROUND(EXTRACT(epoch FROM (now() - blocking.query_start)))::int AS blocking_duration_sec,
+                        SUBSTRING(blocking.query FROM 1 FOR 300) AS blocking_statement,
+                        blocking.state AS blocking_state,
+                        COALESCE(l.mode, 'ExclusiveLock') AS lock_mode,
+                        COALESCE(l.locktype, 'relation') AS lock_type
+                    FROM pg_stat_activity blocked
+                    CROSS JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS blocking_pid
+                    JOIN pg_stat_activity blocking ON blocking.pid = blocking_pid
+                    LEFT JOIN pg_locks l ON l.pid = blocking_pid AND l.granted
+                    WHERE blocked.pid != pg_backend_pid()
                     ORDER BY blocked_duration_sec DESC LIMIT 20;
                 """)
                 for r in cur.fetchall():
@@ -1510,20 +1529,33 @@ async def stream_db_realtime(
     Server-Sent Events (SSE) stream pushing live PostgreSQL status,
     active queries, and lock tree updates every 2 seconds.
     """
-    # Verify token
-    if token:
-        try:
-            from jose import jwt
-            from .auth import SECRET_KEY, ALGORITHM
-            jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        except Exception:
-            raise HTTPException(status_code=401, detail="Invalid token")
+    # Enforce mandatory authentication token
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication token required")
+    try:
+        from jose import jwt
+        from .auth import SECRET_KEY, ALGORITHM
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if not username:
+            raise HTTPException(status_code=401, detail="Invalid token payload")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    # Verify user exists in database
+    db_auth = SessionLocal()
+    try:
+        user = db_auth.query(User).filter(User.username == username).first()
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+    finally:
+        db_auth.close()
 
     async def event_generator():
         while True:
             db = SessionLocal()
             try:
-                data = collect_full_realtime_db_snapshot(db)
+                data = await asyncio.to_thread(collect_full_realtime_db_snapshot, db)
                 yield f"data: {json.dumps(data)}\n\n"
             except Exception as e:
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
@@ -1646,38 +1678,28 @@ def query_live_db_blocker_info(db_conns: list, target_db_label: str = None, targ
                         "query": row[11] or "(No query text available)"
                     }
 
-            # 2. Query detailed Lock Tree (pg_locks + pg_stat_activity)
+            # 2. Query detailed Lock Tree using pg_blocking_pids()
             lock_query = """
                 SELECT 
-                    blocked_locks.pid AS blocked_pid,
-                    blocking_locks.pid AS blocking_pid,
-                    blocking_activity.usename AS blocking_user,
-                    blocking_activity.state AS blocking_state,
-                    ROUND(EXTRACT(epoch FROM (now() - blocking_activity.query_start)))::int AS blocking_dur_s,
-                    ROUND(EXTRACT(epoch FROM (now() - blocking_activity.state_change)))::int AS blocking_state_dur_s,
-                    blocking_locks.mode AS lock_mode,
-                    blocking_locks.locktype AS lock_type,
-                    blocked_activity.query AS blocked_statement,
-                    blocking_activity.query AS blocking_statement
-                FROM pg_catalog.pg_locks blocked_locks
-                JOIN pg_catalog.pg_stat_activity blocked_activity ON blocked_locks.pid = blocked_activity.pid
-                JOIN pg_catalog.pg_locks blocking_locks 
-                    ON blocking_locks.locktype = blocked_locks.locktype
-                    AND blocking_locks.database IS NOT DISTINCT FROM blocked_locks.database
-                    AND blocking_locks.relation IS NOT DISTINCT FROM blocked_locks.relation
-                    AND blocking_locks.page IS NOT DISTINCT FROM blocked_locks.page
-                    AND blocking_locks.tuple IS NOT DISTINCT FROM blocked_locks.tuple
-                    AND blocking_locks.virtualxid IS NOT DISTINCT FROM blocked_locks.virtualxid
-                    AND blocking_locks.transactionid IS NOT DISTINCT FROM blocked_locks.transactionid
-                    AND blocking_locks.classid IS NOT DISTINCT FROM blocked_locks.classid
-                    AND blocking_locks.objid IS NOT DISTINCT FROM blocked_locks.objid
-                    AND blocking_locks.objsubid IS NOT DISTINCT FROM blocked_locks.objsubid
-                    AND blocking_locks.pid != blocked_locks.pid
-                JOIN pg_catalog.pg_stat_activity blocking_activity ON blocking_locks.pid = blocking_activity.pid
+                    blocked.pid AS blocked_pid,
+                    blocking_pid,
+                    blocking.usename AS blocking_user,
+                    blocking.state AS blocking_state,
+                    ROUND(EXTRACT(epoch FROM (now() - blocking.query_start)))::int AS blocking_dur_s,
+                    ROUND(EXTRACT(epoch FROM (now() - blocking.state_change)))::int AS blocking_state_dur_s,
+                    COALESCE(l.mode, 'ExclusiveLock') AS lock_mode,
+                    COALESCE(l.locktype, 'relation') AS lock_type,
+                    blocked.query AS blocked_statement,
+                    blocking.query AS blocking_statement
+                FROM pg_stat_activity blocked
+                CROSS JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS blocking_pid
+                JOIN pg_stat_activity blocking ON blocking.pid = blocking_pid
+                LEFT JOIN pg_locks l ON l.pid = blocking_pid AND l.granted
+                WHERE blocked.pid != pg_backend_pid()
             """
             params = []
             if target_pid:
-                lock_query += " WHERE blocked_locks.pid = %s"
+                lock_query += " AND blocked.pid = %s"
                 params.append(target_pid)
 
             cur.execute(lock_query, params)
@@ -1908,17 +1930,17 @@ def start_benchmark(
             raise HTTPException(status_code=400, detail="sql_query is required for PostgreSQL benchmark")
 
         db_conns = json.loads(setting.db_connections_json) if setting and setting.db_connections_json else []
+        if not db_conns:
+            raise HTTPException(status_code=400, detail="No DB Connections configured in Settings")
+
         selected_conn = None
         for c in db_conns:
             if c.get("label") == req.db_label or c.get("host") == req.db_label:
                 selected_conn = c
                 break
 
-        if not selected_conn and db_conns:
-            selected_conn = db_conns[0]
-
         if not selected_conn:
-            raise HTTPException(status_code=400, detail="No DB Connections configured in Settings")
+            raise HTTPException(status_code=404, detail=f"Database '{req.db_label}' not found in Settings")
 
         background_tasks.add_task(
             benchmark_engine.run_postgres_benchmark,

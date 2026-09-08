@@ -166,7 +166,7 @@ def _fetch_springboot_actuator_metrics(prometheus_ip: str, prometheus_port: str,
     if not safe_projects:
         return results
 
-    app_jobs = "|".join([f"{p}-*" for p in safe_projects] + [f"{p}" for p in safe_projects])
+    app_jobs = "|".join([f"{p}-.*" for p in safe_projects] + [f"{p}" for p in safe_projects])
 
     hikari_pend_q = f'sum(hikaricp_connections_pending{{job=~"{app_jobs}"}}) by (job)'
     hikari_act_q  = f'sum(hikaricp_connections_active{{job=~"{app_jobs}"}}) by (job)'
@@ -446,7 +446,8 @@ def _fetch_db_health(db_connections_json_str: str) -> list:
                     SELECT pid, state, wait_event_type, wait_event,
                            pg_blocking_pids(pid) AS blocking_pids,
                            ROUND(EXTRACT(epoch FROM (now() - query_start))) AS dur,
-                           SUBSTRING(query FROM 1 FOR 150) AS q
+                           SUBSTRING(query FROM 1 FOR 150) AS q,
+                           query AS full_query
                     FROM pg_stat_activity
                     WHERE state != 'idle' AND pid != pg_backend_pid()
                       AND backend_type != 'walsender'
@@ -459,8 +460,8 @@ def _fetch_db_health(db_connections_json_str: str) -> list:
                 raw_rows = cur.fetchall()
                 l_queries = []
                 for r in raw_rows:
-                    pid, state, wait_type, wait_ev, blocking, dur, q_text = r[0], r[1], r[2], r[3], r[4], r[5], (r[6] or "").strip()
-                    plan_info = _explain_query_plan(cur, q_text)
+                    pid, state, wait_type, wait_ev, blocking, dur, q_text, full_q = r[0], r[1], r[2], r[3], r[4], r[5], (r[6] or "").strip(), (r[7] or "").strip()
+                    plan_info = _explain_query_plan(cur, full_q)
                     l_queries.append({
                         "pid": pid,
                         "state": state,
@@ -615,9 +616,14 @@ def compute_health_score(container_metrics: dict, pgb_metrics: dict, db_health: 
             score -= 5
             alerts.append(f"🟠 NOTICE: PgBouncer [{db_name}] {int(waiting)} client waiting")
 
-    # Long-running Queries + Lock Contention + Wait Events
+    # Long-running Queries + Lock Contention + Wait Events + DB Errors
     for entry in db_health:
         label = entry.get("label", "DB")
+        if entry.get("error"):
+            score -= 40
+            alerts.append(f"🔴 CRITICAL: DB [{label}] Connection Failed: {entry.get('error')}")
+            continue
+
         for q in entry.get("long_queries", []):
             dur = q.get("duration_sec", 0)
             wait_type = q.get("wait_event_type")
@@ -673,9 +679,13 @@ def compute_health_score(container_metrics: dict, pgb_metrics: dict, db_health: 
         alerts.append(f"🟡 WARNING: Loki Error/5xx count = {error_count} ใน 5 นาทีที่ผ่านมา")
 
     score = max(0, score)
-    if score >= 80:
+    has_critical = any(a.startswith("🔴 CRITICAL") for a in alerts)
+    if has_critical and score > 49:
+        score = min(score, 49)
+
+    if score >= 80 and not has_critical:
         status = "healthy"
-    elif score >= 50:
+    elif score >= 50 and not has_critical:
         status = "warning"
     else:
         status = "critical"
