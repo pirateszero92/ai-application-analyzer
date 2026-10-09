@@ -22,6 +22,10 @@ class BenchmarkEngine:
         self.name = "Benchmark Run"
         self.mode = "http"  # 'http' or 'postgres'
         self.target_summary = ""
+        self.target_sql = None
+        self.target_db_info = None
+        self.target_url = None
+        self.target_method = None
         self.concurrent_users = 10
         self.duration_seconds = 15
         self.start_time = 0.0
@@ -95,6 +99,10 @@ class BenchmarkEngine:
         self.name = name or "HTTP Benchmark"
         self.mode = "http"
         self.target_summary = f"{method.upper()} {target_url}"
+        self.target_url = target_url
+        self.target_method = method
+        self.target_sql = None
+        self.target_db_info = None
         self.concurrent_users = max(1, min(1000, concurrent_users))
         self.duration_seconds = max(3, min(300, duration_seconds))
         self.start_time = time.time()
@@ -213,6 +221,10 @@ class BenchmarkEngine:
         db_label = db_conn_info.get("label", db_conn_info.get("host", "PostgreSQL"))
         cleaned_sql = sql_query.strip().replace('\n', ' ')[:100]
         self.target_summary = f"[{db_label}] {cleaned_sql}"
+        self.target_sql = sql_query
+        self.target_db_info = db_conn_info
+        self.target_url = None
+        self.target_method = None
         self.concurrent_users = max(1, min(1000, concurrent_users))
         self.duration_seconds = max(3, min(300, duration_seconds))
         self.start_time = time.time()
@@ -347,6 +359,10 @@ class BenchmarkEngine:
             "name": self.name,
             "mode": self.mode,
             "target_summary": self.target_summary,
+            "target_sql": getattr(self, "target_sql", None),
+            "target_db_info": getattr(self, "target_db_info", None),
+            "target_url": getattr(self, "target_url", None),
+            "target_method": getattr(self, "target_method", None),
             "concurrent_users": self.concurrent_users,
             "duration_seconds": self.duration_seconds,
             "elapsed_seconds": round(self.elapsed_seconds, 1),
@@ -355,6 +371,8 @@ class BenchmarkEngine:
             "failed_operations": self.failed_ops,
             "ops_per_sec": round(ops_per_sec, 1),
             "avg_latency_ms": round(avg_ms, 2),
+            "min_latency_ms": round(min_ms, 2),
+            "max_latency_ms": round(max_ms, 2),
             "p50_ms": round(p50_ms, 2),
             "p90_ms": round(p90_ms, 2),
             "p95_ms": round(p95_ms, 2),
@@ -403,7 +421,7 @@ class BenchmarkEngine:
             save_db.close()
 
     def _call_ai_benchmark_analysis(self, setting, r: dict) -> str:
-        """Calls AI Model to analyze performance benchmark results."""
+        """Calls AI Model to analyze performance benchmark results with real infrastructure and config awareness."""
         if not setting:
             return "AI Settings not configured"
 
@@ -419,41 +437,154 @@ class BenchmarkEngine:
         if is_ollama_native:
             api_url = f"{host_url.rstrip('/')}/api/chat"
 
+        # 1. Parse Server Hardware Infrastructure Specs
+        server_specs_json = getattr(setting, "server_specs_json", None)
+        specs_list = []
+        if server_specs_json:
+            try:
+                specs_list = json.loads(server_specs_json) if isinstance(server_specs_json, str) else server_specs_json
+            except Exception:
+                pass
+
+        if specs_list and isinstance(specs_list, list):
+            hw_lines = ["### ข้อมูลทรัพยากรฮาร์ดแวร์เซิร์ฟเวอร์จริง (Production Hardware Specifications):"]
+            for idx, spec in enumerate(specs_list, 1):
+                if not isinstance(spec, dict):
+                    continue
+                name = spec.get('name', f'Server-{idx}')
+                role = spec.get('role', 'N/A')
+                cpu = spec.get('cpu_model', '')
+                cores = spec.get('cpu_cores', '')
+                ram = spec.get('ram_gb', '')
+                storage = spec.get('storage_type', '')
+                sz = f" ({spec['storage_size_gb']} GB)" if spec.get('storage_size_gb') else ""
+                notes = spec.get('notes', '')
+                hw_lines.append(f"- **{name}** ({role}): CPU {cores} Cores ({cpu}), RAM {ram} GB, Storage {storage}{sz}" + (f" [{notes}]" if notes else ""))
+            hw_context = "\n".join(hw_lines)
+        else:
+            hw_context = (
+                "### ข้อมูลทรัพยากรฮาร์ดแวร์เซิร์ฟเวอร์จริง (Production Hardware Specifications Baseline):\n"
+                "- **WMS-DB Server (10.1.1.9)**: 16 vCPUs (Intel Xeon Platinum 8168), RAM 64 GB, 500 GB NVMe SSD\n"
+                "- **TMS-DB Server (10.1.1.24)**: 16 vCPUs (Intel Xeon Platinum 8168), RAM 32 GB, 350 GB NVMe SSD\n"
+                "- **WMS-APP / Web Server (10.1.1.4)**: 16 vCPUs, RAM 32 GB (รัน 14 สาขาคอนเทนเนอร์)"
+            )
+
+        # 2. Parse Active Database & PgBouncer Configuration
+        pg_conf = getattr(setting, "postgresql_conf", None) or ""
+        pgb_ini = getattr(setting, "pgbouncer_ini", None) or ""
+
+        cfg_lines = ["### สถานะการตั้งค่า Database และ Connection Pool ปัจจุบัน (Active Configurations):"]
+        if pg_conf.strip():
+            cfg_lines.append("#### คอนฟิก PostgreSQL ปัจจุบัน (postgresql.conf):")
+            cfg_lines.append(f"```ini\n{pg_conf[:3000].strip()}\n```")
+        else:
+            cfg_lines.append(
+                "- **PostgreSQL 16 Tuning (WMS-DB 10.1.1.9)**: `shared_buffers = 16GB` (25% ของ RAM 64GB), "
+                "`effective_cache_size = 48GB` (75% ของ RAM), `work_mem = 32MB`, `maintenance_work_mem = 2GB`, `max_connections = 300`"
+            )
+
+        if pgb_ini.strip():
+            cfg_lines.append("#### คอนฟิก PgBouncer ปัจจุบัน (pgbouncer.ini):")
+            cfg_lines.append(f"```ini\n{pgb_ini[:3000].strip()}\n```")
+        else:
+            cfg_lines.append(
+                "- **PgBouncer Status**: เปิดใช้งานและรันอยู่จริงบน Port 6432 (`pool_mode = transaction`, "
+                "`default_pool_size = 30`, `min_pool_size = 10`, `reserve_pool_size = 15`, `max_client_conn = 1000`)"
+            )
+        config_context = "\n".join(cfg_lines)
+
+        # 3. Format Target Detail
+        target_detail = ""
+        if r.get("mode") == "postgres":
+            db_info = r.get("target_db_info") or {}
+            host = db_info.get("host", "N/A")
+            port = db_info.get("port", "N/A")
+            dbname = db_info.get("dbname", "N/A")
+            sql = r.get("target_sql") or r.get("target_summary")
+            pool_note = ""
+            if str(port) == "6432":
+                pool_note = " ⚡ (การทดสอบนี้ยิงผ่าน PgBouncer Transaction Connection Pool โดยตรง)"
+            elif str(port) == "5432":
+                pool_note = " ⚠️ (การทดสอบนี้ยิงตรงเข้า PostgreSQL Native Engine Port 5432)"
+            target_detail = (
+                f"- **ฐานข้อมูลเป้าหมาย**: Host `{host}`, Port `{port}`, Database `{dbname}`{pool_note}\n"
+                f"- **คำสั่ง SQL Statement ที่ทดสอบ**:\n```sql\n{sql}\n```"
+            )
+        else:
+            url = r.get("target_url") or r.get("target_summary")
+            method = r.get("target_method") or "HTTP"
+            target_detail = f"- **HTTP Endpoint เป้าหมาย**: `{method}` `{url}`"
+
         system_prompt = (
-            "คุณคือ Senior Performance Engineer & System Architect ผู้เชี่ยวชาญด้านระบบ WMS/TMS "
-            "หน้าที่ของคุณคือวิเคราะห์ผลการรันทดสอบประสิทธิภาพ (Performance Benchmark Load Test) "
-            "ประเมินคอขวด (Bottlenecks), ค่า Latency Percentiles (p50/p90/p99), อัตรา QPS/RPS และให้คำแนะนำการเพิ่มประสิทธิภาพจูนระบบ\n\n"
-            "กฎเหล็ก: ห้ามใช้ HTML แท็กทุกชนิด (<br>, <b> ฯลฯ) Output ต้องเป็น Pure Markdown เท่านั้น"
+            "คุณคือ Principal Database Administrator (DBA), Senior Performance Engineer และ System Architect ผู้เชี่ยวชาญระดับสูงด้านระบบ WMS/TMS\n"
+            "หน้าที่ของคุณคือวิเคราะห์ผลการทดสอบประสิทธิภาพ (Performance Benchmark Load Test) "
+            "อย่างแม่นยำ ตรงไปตรงมา อิงตามสภาพแวดล้อมฮาร์ดแวร์จริง (Real Infrastructure Specs) และคอนฟิกของระบบจริง (Active Production Config) ที่ให้ไว้อย่างเคร่งครัด\n\n"
+            "======================================================================\n"
+            "🚨 กฎเหล็กสำคัญอย่างยิ่ง (STRICT ARCHITECTURAL RULES):\n"
+            "======================================================================\n"
+            "1. [ห้ามแนะนำให้ติดตั้ง PgBouncer เด็ดขาด]:\n"
+            "   - ระบบมี PgBouncer ติดตั้งและเปิดใช้งานอยู่แล้วบน Port 6432 (Transaction Pooling) ตามที่ระบุใน pgbouncer.ini\n"
+            "   - หาก Port ที่ทดสอบคือ 6432 แปลว่ากำลังรันผ่าน PgBouncer อยู่แล้ว ห้ามพูดว่า 'หากยังไม่ได้ใช้ แนะนำให้ติดตั้ง PgBouncer' เด็ดขาด!\n\n"
+            "2. [ห้ามแนะนำให้ปรับ shared_buffers เป็น 25% ของ RAM เด็ดขาด]:\n"
+            "   - เซิร์ฟเวอร์ WMS-DB (10.1.1.9) มี RAM 64GB และได้ตั้งค่า `shared_buffers = 16GB` (คิดเป็น 25% ของ RAM) ไว้อย่างถูกต้องสมบูรณ์แล้วใน postgresql.conf\n"
+            "   - ห้ามแนะนำให้ไปตรวจสอบหรือตั้งค่า 25% ซ้ำซ้อนอีก เพราะทำไปแล้วและทำงานอยู่จริงแล้ว!\n\n"
+            "3. [ประเมิน Latency และ Throughput เทียบกับ Production Baseline จริงอย่างสมเหตุสมผล]:\n"
+            "   - ภาระงานจริงของ WMS/TMS มีปริมาณ Transaction ปกติเพียง 10 - 20 QPS เท่านั้น\n"
+            "   - หากผล Benchmark ทำได้ระดับ 1,000 - 3,000+ ops/sec ถือเป็นประสิทธิภาพที่รองรับโหลดได้สูงกว่าโหลดจริงในระบบถึง 100 - 200 เท่า (Very High Capacity)\n"
+            "   - การทดสอบด้วย Simulated Users จำนวนมากแบบ Zero-Think-Time (ยิงต่อเนื่องวนลูปไม่มีหยุด) แล้วได้ Success Rate 100% ถือเป็นประสิทธิภาพระดับ 'ยอดเยี่ยมและเสถียรมาก' (Healthy & Rock-solid)\n"
+            "   - ค่า p99 ที่ประมาณ 30-70 ms ภายใต้ Concurrency ระดับ 100-300 Users เกิดจาก Socket / Connection Queueing ตามธรรมชาติเมื่อหลายร้อย Worker แย่ง CPU Cores ไม่ใช่ปัญหา Jitter หรือ Bottleneck วิกฤต ห้ามตื่นตระหนกเกินจริง!\n\n"
+            "4. [วิเคราะห์แยกแยะตามประเภทของ Target Query ให้ตรงจุด]:\n"
+            "   - หาก Query เป็นการอ่านตารางระบบ / สถิติ (เช่น pg_stat_database, sum(blks_read), sum(xact_commit)):\n"
+            "     * นี่คือสถิติระดับ Engine สำหรับงาน Dashboard / Monitoring ไม่ใช่ Query การทำงานจริงของธุรกิจ (Business Query)\n"
+            "     * คำแนะนำที่ถูกต้อง: ให้แนะนำทำ Application Caching (Redis Cache TTL 5-15 วินาที) สำหรับหน้า Dashboard สถิติ หรือย้ายงานสถิติไปอ่านจาก Read Replica (10.1.1.99) เพื่อไม่ให้รบกวน Master DB\n"
+            "   - หาก Query เป็น Business Query บนตาราง WMS/TMS (schema 'dc' หรือ 'public'):\n"
+            "     * แนะนำให้ตรวจเช็ค Index บนคอลัมน์ใน WHERE/JOIN (พึงจำว่า schema WMS คือ 'dc' และชื่อคอลัมน์ผู้ใช้คือ 'user_name') และใช้ EXPLAIN (ANALYZE, BUFFERS)\n\n"
+            "5. [คำแนะนำด้าน Application Connection Pool ที่ถูกต้อง]:\n"
+            "   - แนะนำการปรับ Application Connection Pool (เช่น HikariCP ใน Spring Boot): ให้ตั้ง maximumPoolSize ให้สัมพันธ์กับ PgBouncer default_pool_size (เช่น 10-30 connections ต่อ App instance)\n\n"
+            "6. [รูปแบบการตอบ]:\n"
+            "   - ห้ามใช้แท็ก HTML ทุกชนิด (<br>, <b>, <span> ฯลฯ) Output ต้องเป็น Clean Markdown เท่านั้น"
         )
 
-        user_prompt = f"""ผลการทดสอบประสิทธิภาพ (Performance Benchmark Load Test):
+        success_pct = (r['success_operations'] / max(1, r['total_operations'])) * 100.0
+        user_prompt = f"""รายงานผลการทดสอบประสิทธิภาพ (Performance Benchmark Load Test Result):
 
+### 1. ข้อมูลการทดสอบ (Test Setup):
 - **ชื่อการทดสอบ**: {r['name']}
-- **โหมด**: {r['mode'].upper()} (Target: {r['target_summary']})
-- **จำลอง User เข้าพร้อมกัน (Simulated Users)**: {r['concurrent_users']} users
+- **โหมดการทดสอบ**: {r['mode'].upper()}
+{target_detail}
+- **จำนวน Concurrent Simulated Users**: {r['concurrent_users']} users (Zero-Think-Time Loop)
 - **ระยะเวลาการทดสอบ**: {r['duration_seconds']} วินาที
-- **จำนวน Operations ทั้งหมด**: {r['total_operations']} รายการ (สำเร็จ: {r['success_operations']}, ล้มเหลว/Error: {r['failed_operations']})
-- **Throughput (RPS/QPS)**: {r['ops_per_sec']} ops/sec
+- **จำนวน Operations ทั้งหมด**: {r['total_operations']:,} รายการ
+- **อัตราความสำเร็จ (Success Rate)**: {r['success_operations']:,} / {r['total_operations']:,} ({success_pct:.2f}%)
+- **จำนวนความล้มเหลว (Failed / Errors)**: {r['failed_operations']} รายการ
+- **Throughput อัตราการประมวลผล**: **{r['ops_per_sec']:,} ops/sec** (เทียบกับ Production Normal Peak ที่ 10-20 QPS)
+
+### 2. ข้อมูล Latency Profile (มิลลิวินาที):
 - **Average Latency**: {r['avg_latency_ms']} ms
-- **Percentiles**:
-  - p50 (Median): {r['p50_ms']} ms
-  - p90: {r['p90_ms']} ms
-  - p95: {r['p95_ms']} ms
-  - p99 (Worst 1%): {r['p99_ms']} ms
-- **Status Breakdown**: {json.dumps(r['status_breakdown'])}
+- **Min Latency**: {r.get('min_latency_ms', 0)} ms
+- **Max Latency**: {r.get('max_latency_ms', 0)} ms
+- **p50 (Median)**: {r['p50_ms']} ms
+- **p90**: {r['p90_ms']} ms
+- **p95**: {r['p95_ms']} ms
+- **p99 (Worst 1% Tail Latency)**: {r['p99_ms']} ms
+- **Status Codes Breakdown**: {json.dumps(r['status_breakdown'], ensure_ascii=False)}
 
 ---
+{hw_context}
+---
+{config_context}
+---
 
-จงวิเคราะห์และตอบตามโครงสร้างต่อไปนี้:
+จงวิเคราะห์ผลการทดสอบและตอบตามโครงสร้างต่อไปนี้อย่างละเอียด ชัดเจน และเป็นมืออาชีพ:
 
-## Performance Summary & Health Assessment
-(ประเมินประสิทธิภาพโดยรวมภายใต้จำนวน {r['concurrent_users']} Concurrent Users)
+## 1. 📊 Performance Summary & Capacity Assessment
+(ประเมินสถานะระบบ โดยเทียบ Throughput และ Latency กับปริมาณโหลดจริงของระบบ WMS/TMS ซึ่งปกติอยู่ที่ 10-20 QPS พร้อมประเมินความเสถียรและ Success Rate ภายใต้ Concurrency {r['concurrent_users']} Users)
 
-## Latency & Bottleneck Analysis
-(วิเคราะห์ค่า p90/p99, สาเหตุของความช้า และคอขวดที่อาจเกิดขึ้น)
+## 2. 🔍 Realistic Latency & Concurrency Analysis
+(วิเคราะห์ค่า p50/p90/p99 ภายใต้ Concurrent Users {r['concurrent_users']} คน อธิบายสาเหตุของค่า p99 อย่างสมเหตุสมผลตามสภาพแวดล้อมฮาร์ดแวร์จริง เช่น Socket queueing / PgBouncer pool queueing โดยไม่ตื่นตระหนกเกินจริง)
 
-## AI Optimization & Tuning Recommendations
-(คำแนะนำการจูนระบบ ทั้งด้าน Database Index, Connection Pool, JVM Heap, หรือ API Rate Limit)"""
+## 3. 🎯 Targeted & Actionable Recommendations
+(ให้คำแนะนำที่ตรงจุด ปฏิบัติได้จริง สอดคล้องกับสภาพแวดล้อมที่ตั้งค่าไว้แล้ว โดยยึดตามกฎเหล็ก ห้ามแนะนำสิ่งที่ระบบทำไว้แล้ว เช่น PgBouncer หรือ shared_buffers 25% แต่ให้แนะนำด้าน Application Caching (Redis), Read Replica, HikariCP Sizing, หรือ Indexing ที่เหมาะสมกับชนิดของ Query)"""
 
         messages = [
             {"role": "system", "content": system_prompt},
