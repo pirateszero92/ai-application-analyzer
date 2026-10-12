@@ -892,16 +892,49 @@ def fetch_direct_db_diagnostics(connections_json_str: str) -> str:
                 lines.append(f"  [!] Failed to query table stats: {e}")
                 conn.rollback()
 
-            # D. Actual Existing Indexes — ALL indexes in primary schemas (dc for WMS, public for TMS)
+            # D. Actual Existing Indexes on Target & Core Business Tables (Targeted Extraction)
             try:
-                cur.execute("""
+                target_tables = {
+                    'wms_product', 'wms_location', 'wms_location_onhand', 'wms_users', 
+                    'wms_employees', 'wms_tasks', 'wms_order', 'wms_menu',
+                    'tms_master_mapping_code', 'tms_users', 'tms_employees', 'tms_customer',
+                    'tbl_employees', 'tbl_users'
+                }
+                if tables:
+                    for s_name, r_name, *_ in tables:
+                        target_tables.add(r_name)
+
+                # Target schemas: prioritize primary production schemas 'dc' (WMS) and 'public' (TMS)
+                target_schemas = {'dc', 'public'}
+                # Extract table names and specific branch schemas from slowest queries if present
+                if slow:
+                    import re
+                    for _, _, _, _, q_text in slow:
+                        found_tbls = re.findall(r'(?:from|join|update|into)\s+([a-zA-Z0-9_]+(?:\.[a-zA-Z0-9_]+)?)', q_text, re.IGNORECASE)
+                        for ft in found_tbls:
+                            parts = ft.split('.')
+                            if len(parts) == 2:
+                                s_part, t_part = parts[0].strip().lower(), parts[1].strip().lower()
+                                if s_part in {'bks', 'ebb', 'klh', 'ksw', 'llk', 'nck', 'nwm', 'pks', 'rtb', 'snk', 'stp', 'vsf', 'vsm'}:
+                                    target_schemas.add(s_part)
+                                if t_part and len(t_part) > 2:
+                                    target_tables.add(t_part)
+                            else:
+                                t_part = parts[0].strip().lower()
+                                if t_part and len(t_part) > 2:
+                                    target_tables.add(t_part)
+
+                tbl_placeholders = ','.join(['%s'] * len(target_tables))
+                sch_placeholders = ','.join(['%s'] * len(target_schemas))
+                cur.execute(f"""
                     SELECT schemaname, tablename, indexname, indexdef 
                     FROM pg_indexes 
-                    WHERE schemaname IN ('dc', 'public')
-                    ORDER BY schemaname, tablename, indexname
-                """)
+                    WHERE tablename IN ({tbl_placeholders})
+                      AND schemaname IN ({sch_placeholders})
+                    ORDER BY CASE WHEN schemaname IN ('dc', 'public') THEN 0 ELSE 1 END, schemaname, tablename, indexname
+                """, list(target_tables) + list(target_schemas))
                 all_indexes = cur.fetchall()
-                lines.append("  [Existing Indexes in Database (ข้อมูลจริงทั้งหมดดึงสดจาก DB 100% — ต้องใช้ตรวจสอบก่อนแนะนำสร้าง Index ใหม่ทุกครั้ง)]")
+                lines.append("  [Existing Indexes on Target Tables (ข้อมูลจริงทั้งหมดดึงสดจาก DB 100% — ต้องใช้ตรวจสอบก่อนแนะนำสร้าง Index ใหม่ทุกครั้ง)]")
                 if all_indexes:
                     current_table = None
                     for schema, tbl, idx_name, idx_def in all_indexes:
@@ -911,7 +944,7 @@ def fetch_direct_db_diagnostics(connections_json_str: str) -> str:
                             lines.append(f"    📋 Table: {full_table}")
                         lines.append(f"      ✅ {idx_name}: {idx_def}")
                 else:
-                    lines.append("    - No user indexes found in primary schemas.")
+                    lines.append("    - No user indexes found on target tables.")
             except Exception as e:
                 lines.append(f"  [!] Failed to query pg_indexes: {e}")
                 conn.rollback()
@@ -937,7 +970,8 @@ def analyze_logs_with_ai(
     postgresql_conf: str = None,
     pgbouncer_ini: str = None,
     pg_hba_conf: str = None,
-    server_spec: dict = None
+    server_spec: dict = None,
+    direct_db_text: str = None
 ) -> str:
     # Truncate text inputs to prevent token context length overflow in LM Studio
     if len(logs_text) > 24000:
@@ -946,6 +980,8 @@ def analyze_logs_with_ai(
         slow_queries_text = slow_queries_text[:16000] + "\n... [TRUNCATED TO PREVENT CONTEXT OVERFLOW] ..."
     if len(prometheus_metrics_text) > 16000:
         prometheus_metrics_text = prometheus_metrics_text[:16000] + "\n... [TRUNCATED TO PREVENT CONTEXT OVERFLOW] ..."
+    if direct_db_text and len(direct_db_text) > 20000:
+        direct_db_text = direct_db_text[:20000] + "\n... [TRUNCATED TO PREVENT CONTEXT OVERFLOW] ..."
 
     db_config_text = ""
     if postgresql_conf:
@@ -995,11 +1031,11 @@ def analyze_logs_with_ai(
         "   - ในฐานข้อมูล wms: ตารางส่วนใหญ่อยู่ใน schema 'dc' (เช่น dc.wms_location, dc.wms_users, dc.wms_employees) ห้ามอ้างอิงเป็น public\n"
         "   - ในฐานข้อมูล tms: ตารางส่วนใหญ่อยู่ใน schema 'public' (เช่น public.tms_master_mapping_code)\n"
         "2. [ตรวจสอบ Index ที่มีอยู่แล้ว - Query-First Policy]:\n"
-        "   - ใน Section [6] Section D '[Existing Indexes in Database]' ระบบได้ทำการ QUERY รายชื่อ Index ทั้งหมด 100% จาก DB จริง (ทั้ง schema 'dc' ของ WMS และ schema 'public' ของ TMS) มาให้แล้ว\n"
+        "   - ใน Section [6] Section D '[Existing Indexes on Target Tables]' ระบบได้ทำการ QUERY รายชื่อ Index ทั้งหมด 100% จาก DB จริงมาให้แล้ว\n"
         "   - ก่อนเสนอคำแนะนำสร้าง Index ใหม่บนตารางใดๆ คุณต้องตรวจสอบ Section D ของตารางนั้นๆ ทีละตัวก่อนเสมอ:\n"
         "     * Primary Key (pkey) คือ Index (B-Tree Unique Index) อยู่แล้ว เช่น `wms_location_pkey` บน `location_id` **ห้ามเสนอสร้าง Index บนคอลัมน์ที่เป็น Primary Key ซ้ำเด็ดขาด!**\n"
         "     * คอลัมน์แรกใน Composite Index หรือ Unique Key (เช่น `product_code` ใน `idx_location_onhand_pick (product_code, company_id, ...)`) ถือว่ามี Index ครอบคลุมแล้ว **ห้ามเสนอสร้าง Index เดี่ยวซ้ำอีก!**\n"
-        "     * หากพบว่าใน Section D มี Index ที่ครอบคลุมคอลัมน์นั้นแล้ว -> **ห้ามใส่คำสั่ง CREATE INDEX ใน Action Plan เด็ดขาด!** ให้ระบุในสรุปผลว่า 'ตรวจสอบแล้ว มี Index ครอบคลุมแล้ว ดำเนินการเสร็จสิ้น'\n"
+        "     * หากพบว่าใน Section D มี Index ที่ครอบคลุมคอลัมน์นั้นแล้ว (เช่น `idx_wms_prod_code_lower` บน `lower(product_code)`) -> **ห้ามใส่คำสั่ง CREATE INDEX ใน Action Plan เด็ดขาด!** ให้ระบุในสรุปผลว่า 'ตรวจสอบแล้ว มี Index ครอบคลุมแล้ว ดำเนินการเสร็จสิ้น'\n"
         "     * อนุญาตให้สร้างคำสั่ง `CREATE INDEX CONCURRENTLY IF NOT EXISTS` ใน Action Plan ได้เฉพาะคอลัมน์ที่ตรวจสอบใน Section D แล้วพบว่า **ยังไม่มี Index อยู่เลยจริงๆ** เท่านั้น\n"
         "3. [คอลัมน์และคีย์เวิร์ดที่ถูกต้อง]:\n"
         "   - สำหรับตาราง dc.wms_users คอลัมน์เก็บชื่อผู้ใช้คือ 'user_name' (ไม่ใช่ username)\n"
@@ -1022,7 +1058,7 @@ def analyze_logs_with_ai(
         "8. [Cumulative Counter Awareness - เข้าใจค่าสะสม]:\n"
         "   - ค่า seq_scan และ idx_scan ใน pg_stat_user_tables เป็นค่า CUMULATIVE (สะสมตั้งแต่ last stats reset) ไม่ใช่ค่าปัจจุบัน\n"
         "   - seq_scan สูง ไม่ได้หมายความว่า 'ขาด Index' เสมอ! อาจเป็นค่าสะสมจากก่อนที่จะสร้าง Index\n"
-        "   - ก่อนสรุปว่าตารางใด 'ขาด Index' ต้องตรวจสอบรายการ Index จริงใน Section D '[Existing Indexes in Database]' ก่อนเสมอ\n"
+        "   - ก่อนสรุปว่าตารางใด 'ขาด Index' ต้องตรวจสอบรายการ Index จริงใน Section D '[Existing Indexes on Target Tables]' ก่อนเสมอ\n"
         "   - หาก Section D แสดงว่าตารางมี Index ครอบคลุมคอลัมน์ที่ใช้ Filter/Sort แล้ว ให้สรุปว่า 'มี Index ครอบคลุมแล้ว ค่า seq_scan ที่สูงเป็นค่าสะสมจากอดีต' และห้ามแนะนำสร้าง Index ซ้ำ\n"
         "9. [Production-Only Focus - ห้ามกล่าวถึง Dev/Staging เด็ดขาด]:\n"
         "   - ให้โฟกัสวิเคราะห์และแนะนำเฉพาะ Production Nodes เท่านั้น ได้แก่ WMS-DB-Prod (10.1.1.9) และ TMS-DB-Prod (10.1.1.24)\n"
@@ -1031,10 +1067,29 @@ def analyze_logs_with_ai(
         "   - ห้ามใช้แท็ก HTML ทุกชนิดในการตอบ เช่น <br>, <br/>, <br />, <b>, <i>, <ul>, <li> โดยเด็ดขาด!\n"
         "   - เมื่อต้องการขึ้นบรรทัดใหม่ใน Table Cell ให้ใช้วิธีทำ Cell สั้นๆ กระชับ หรือแบ่งออกเป็นหลาย Row แทน ห้ามใส่ <br> ใน Cell เด็ดขาด!\n"
         "   - เมื่อต้องการแสดงตัวอย่าง SQL หรือ Command ใน Action Plan ให้ใช้ Code Block (```sql หรือ ```bash) แยกออกมานอก Table แทน\n"
-        "   - ผลลัพธ์ทั้งหมดต้องเป็น Clean Markdown เท่านั้น ไม่มี HTML ปนเลย"
+        "   - ผลลัพธ์ทั้งหมดต้องเป็น Clean Markdown เท่านั้น ไม่มี HTML ปนเลย\n"
+        "11. [สถาปัตยกรรม 14 สาขา และ Connection Baseline]:\n"
+        "   - โฮสต์แอปพลิเคชัน (10.1.1.4) รันระบบแยกอิสระ 14 สาขาคอนเทนเนอร์ (dc, bks, ebb, klh, ksw, llk, nck, nwm, pks, rtb, snk, stp, vsf, vsm)\n"
+        "   - แต่ละสาขามี Spring Boot Backend ที่เปิด Connection Pool (HikariCP) ขั้นต่ำ ~10 connections เชื่อมต่อไปยัง PgBouncer (10.1.1.9:6432)\n"
+        "   - ดังนั้น Client Connections รวม 140 - 150 connections ที่ต่อเข้า PgBouncer คือ 'สภาวะปกติ (Normal Architecture Baseline)' ไม่ใช่ Connection Leak เด็ดขาด!\n"
+        "   - ในตัวฐานข้อมูล PostgreSQL จริง (Port 5432) มี Server Connections ทำงานจริงเพียง 10-20 connections เท่านั้น เพราะ PgBouncer ทำหน้าที่ Multiplexing ยุบรวม Connection ให้อย่างมีประสิทธิภาพ\n"
+        "   - กฎเหล็ก: หาก 'Clients Waiting' ใน PgBouncer เท่ากับ 0 หรือไม่มี Client ใดติดคิวรอ -> ห้ามวินิจฉัยว่าเป็น Connection Leak และห้ามแนะนำปรับเพิ่ม default_pool_size (30 เหมาะสมมากแล้ว) เด็ดขาด!\n"
+        "12. [การวิเคราะห์คิวรีค้นหา LIKE และ Functional Index]:\n"
+        "   - หากคิวรีใช้ `LIKE '%keyword%'` หรือ `lower(col) LIKE lower(...)` ที่มี Wildcard นำหน้า:\n"
+        "     * B-Tree Index (รวมถึง B-Tree Functional Index บน lower()) จะไม่สามารถใช้งานได้ เพราะ B-Tree รองรับเฉพาะ Prefix Search (ค้นหาขึ้นต้นคำ)\n"
+        "     * ห้ามแนะนำให้สร้าง B-Tree Index ซ้ำซ้อนเด็ดขาด!\n"
+        "     * หากต้องการเร่งความเร็ว ให้แนะนำพิจารณาใช้ Extension `pg_trgm` (GIN Trigram Index: `CREATE INDEX ... USING gin (col gin_trgm_ops)`) หรือปรับโค้ด Application เป็น Prefix Search แทน\n"
+        "13. [การวิเคราะห์คำสั่ง UPDATE และปัญหา Lock Contention]:\n"
+        "   - หากคำสั่งที่ช้าเป็นคำสั่ง `UPDATE ... WHERE ...` และใน Section D แสดงว่ามี Primary Key หรือ Unique Index อยู่แล้ว:\n"
+        "     * คิวรีนี้ใช้ Index Scan อยู่แล้ว ความล่าช้าไม่ได้เกิดจากการขาด Index!\n"
+        "     * ห้ามแนะนำสร้าง Index เพิ่มเติมบนคอลัมน์ WHERE นั้นเด็ดขาด!\n"
+        "     * ให้ระบุว่าเกิดจาก Row Lock Contention (รอทรานแซกชันอื่นที่แตะแถวเดียวกัน), Disk I/O หรือ Trigger และแนะนำปรับลด Transaction Scope ใน Spring Boot แทน"
         + (f"\n\n{hw_context}" if hw_context else "")
     )
-    user_prompt = f"""จงวิเคราะห์ Log ของระบบ WMS/TMS, ข้อมูล SQL Slow Queries จาก Percona Monitoring & Management (PMM), ข้อมูลทรัพยากรคอนเทนเนอร์จาก Prometheus (cAdvisor) และ **เปรียบเทียบกับค่าตั้งค่าฐานข้อมูลปัจจุบัน (DB Configuration Files)** ต่อไปนี้ เพื่อระบุแยกแยะจุดคอขวดระหว่าง Network/Frontend, Backend (Spring Boot), Database (PostgreSQL) และระดับทรัพยากรเครื่อง (CPU/Memory) รวมถึงตรวจสอบหา Error ที่ซ่อนอยู่ และให้แนวทางการจูนค่าปรับปรุง Database/PgBouncer Config ที่มีประสิทธิภาพสอดคล้องกับพฤติกรรมของระบบจริง
+    direct_db_block = f"=== [6] Direct Database Engine Diagnostics (ผลการตรวจสดจาก DB 100% ห้ามมองข้ามเด็ดขาด) ===\n{direct_db_text}\n" if direct_db_text else ""
+    db_config_block = f"Database Configuration Files เพื่อนำมาร่วมวิเคราะห์จูนค่า:\n{db_config_text}\n" if db_config_text else ""
+
+    user_prompt = f"""จงวิเคราะห์ Log ของระบบ WMS/TMS, ข้อมูล SQL Slow Queries จาก Percona Monitoring & Management (PMM), ข้อมูลทรัพยากรคอนเทนเนอร์จาก Prometheus (cAdvisor), **ผลการตรวจสอบสดจากฐานข้อมูล (Direct Database Engine Diagnostics)** และ **เปรียบเทียบกับค่าตั้งค่าฐานข้อมูลปัจจุบัน (DB Configuration Files)** ต่อไปนี้ เพื่อระบุแยกแยะจุดคอขวดระหว่าง Network/Frontend, Backend (Spring Boot), Database (PostgreSQL) และระดับทรัพยากรเครื่อง (CPU/Memory) รวมถึงตรวจสอบหา Error ที่ซ่อนอยู่ และให้แนวทางการจูนค่าปรับปรุง Database/PgBouncer Config ที่มีประสิทธิภาพสอดคล้องกับพฤติกรรมของระบบจริง
 
 เกณฑ์การพิจารณาประสิทธิภาพ:
 1. หากค่า TotalTime สูง แต่ค่า SpringBootTime ต่ำอย่างเห็นได้ชัด -> สาเหตุเกิดจาก Network Overhead / Frontend
@@ -1042,7 +1097,7 @@ def analyze_logs_with_ai(
 3. หากฝั่ง Backend ช้า ให้ตรวจสอบข้อมูล SQL Slow Queries จาก PMM ด้านล่างว่ามีความช้าที่สัมพันธ์กันหรือไม่ (เช่น มี SQL Query ตัวใดที่รันเฉลี่ยช้าและใช้บ่อยในฐานข้อมูล wms/tms)
 4. ร่วมกับการตรวจสอบ Resource Metrics จาก Prometheus เพื่อดูว่ามีตู้คอนเทนเนอร์ตัวใด (เช่น dc-backend-prod, tms-backend-prod) ที่มีอาการ CPU พุ่งทะลุ (High CPU) หรือ Memory สูงผิดปกติจนทำให้แอปพลิเคชันตอบสนองช้าลงหรือไม่
 5. ตรวจสอบว่าในบรรทัดที่เกิดความช้า มีข้อความแจ้งเตือน Error บันทึกอยู่, พ่น HTTP Status 5xx หรือมี Exception โผล่มาด้วยหรือไม่
-6. **เปรียบเทียบและวิเคราะห์ค่าคอนฟิกฐานข้อมูล**: ตรวจดูความจุการเชื่อมต่อ (Connections), ขนาดแรมจัดสรร (Shared Buffers, Work Mem), และความปลอดภัยใน pg_hba.conf โดยตรวจสอบว่าตั้งค่าขัดแย้งหรือสอดคล้องกับอาการของโหลดงานจริงหรือไม่ และแนะนำการปรับจูนที่เป็นรูปธรรมในส่วนท้ายสุดของการวิเคราะห์
+6. **เปรียบเทียบและวิเคราะห์ค่าคอนฟิกฐานข้อมูล**: ตรวจดูความจุการเชื่อมต่อ (Connections), ขนาดแรมจัดสรร (Shared Buffers, Work Mem), และความปลอดภัยใน pg_hba.conf โดยตรวจสอบว่าตั้งค่าขัดแย้งหรือสอดคล้องกับอาการของโหลดงานจริงหรือไม่ และแนะนำการปรับจูนที่เป็นรูปธรรมในส่วนท้ายสุดของการวิเคราะห์ (โดยยึดตามกฎเหล็ก เช่น ห้ามปรับ default_pool_size หาก Clients Waiting = 0)
 
 จงสรุปผลวิเคราะห์เป็นภาษาไทยให้กระชับ ตรงประเด็น เป็นข้อๆ (ไม่เกิน 4 ข้อ) โดยระบุชื่อ Endpoint Path, คำสั่ง SQL/ตารางคอขวด, ชื่อคอนเทนเนอร์ที่มีปัญหาทรัพยากรให้ชัดเจน และเพิ่มข้อแนะนำการจูนค่าคอนฟิกฐานข้อมูลและแผนดำเนินการปฏิบัติจริงทีละขั้นตอน (Step-by-step Action Plan) เช่นการระบุพาธไฟล์คอนฟิก (เช่น /etc/postgresql/16/main/postgresql.conf หรือ /etc/pgbouncer/pgbouncer.ini) คีย์เวิร์ดที่ต้องแก้ไข และคำสั่งสั่ง Reload/Restart (เช่น SELECT pg_reload_conf(); หรือ docker compose restart) ต่อท้ายเป็นข้อที่ 5 (ถ้ามีคำแนะนำที่เป็นประโยชน์สอดคล้องกับปัญหานั้นๆ)
 
@@ -1061,7 +1116,8 @@ SQL Slow Queries จาก PMM QAN:
 cAdvisor Container Metrics (Prometheus):
 {prometheus_metrics_text}
 
-{f"Database Configuration Files เพื่อนำมาร่วมวิเคราะห์จูนค่า: {db_config_text}" if db_config_text else ""}"""
+{direct_db_block}
+{db_config_block}"""
 
     # Setup Payloads based on native vs OpenAI compatible
     if is_ollama_native:
@@ -1071,7 +1127,7 @@ cAdvisor Container Metrics (Prometheus):
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            "options": {"temperature": 0.2},
+            "options": {"temperature": 0.05},
             "stream": False
         }
     else:
@@ -1081,7 +1137,7 @@ cAdvisor Container Metrics (Prometheus):
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            "temperature": 0.2,
+            "temperature": 0.05,
             "stream": False
         }
 
@@ -1396,14 +1452,11 @@ def run_analysis_job(db: Session, report_id: int):
         
         # 2d. Fetch Direct DB Diagnostics (Active queries, lock blockages, missing index stats)
         direct_db_text = fetch_direct_db_diagnostics(setting.db_connections_json)
-        if direct_db_text:
-            prometheus_metrics_text += "\n" + direct_db_text
-
         
         # Save raw data to report
         report.nginx_logs = logs_text
         report.slow_queries = slow_queries_text
-        report.prometheus_metrics = prometheus_metrics_text
+        report.prometheus_metrics = prometheus_metrics_text + (f"\n{direct_db_text}" if direct_db_text else "")
         db.commit()
         
         summary = analyze_logs_with_ai(
@@ -1416,7 +1469,8 @@ def run_analysis_job(db: Session, report_id: int):
             setting.postgresql_conf,
             setting.pgbouncer_ini,
             setting.pg_hba_conf,
-            server_spec=json.loads(setting.server_specs_json) if setting.server_specs_json else None
+            server_spec=json.loads(setting.server_specs_json) if setting.server_specs_json else None,
+            direct_db_text=direct_db_text
         )
         
         # 4. Save and Archive
