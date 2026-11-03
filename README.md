@@ -379,7 +379,7 @@ ls -lh /var/backups/wms_migration/wms_prod_latest_${TIMESTAMP}.dump
 
 2. **ลบและสร้างฐานข้อมูล `wms` ใหม่ให้สะอาดบริสุทธิ์**:
    ```bash
-   sudo -u postgres psql -d postgres -c "DROP DATABASE IF EXISTS wms;"
+   sudo -u postgres psql -d postgres -c "DROP DATABASE IF EXISTS wms WITH (FORCE);"
    sudo -u postgres psql -d postgres -c "CREATE DATABASE wms WITH OWNER postgres ENCODING 'UTF8';"
    ```
 
