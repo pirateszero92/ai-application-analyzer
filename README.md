@@ -309,6 +309,147 @@ SELECT pg_is_in_recovery();
 
 ---
 
+### 7. 🔄 Runbook: คู่มือการ Sync / Migrate ข้อมูลจาก WMS-PROD ไปยัง WMS-UAT (Offline & Manual Step-by-Step)
+
+คู่มือนี้จัดทำขึ้นเพื่อให้ทีม DevOps / DBA หรือนักพัฒนาสามารถดำเนินการคัดลอกฐานข้อมูลชุดสมบูรณ์จาก **WMS Production (`10.1.1.9`)** ไปทับลงบน **WMS UAT (`10.1.1.195`)** สำหรับการทดสอบฟีเจอร์ใหม่ได้อย่างปลอดภัย ไม่กระทบระบบ Production และสามารถปฏิบัติตามได้ทีละขั้นตอนแม้ต้องทำแบบ Manual / Offline
+
+#### 📌 ข้อมูลระบบและข้อกำหนดเบื้องต้น
+* **เครื่องต้นทาง (Source - PROD)**: `10.1.1.9` (PostgreSQL 16, RAM 64GB, 16 Cores)
+* **เครื่องปลายทาง (Target - UAT)**: `10.1.1.195` (PostgreSQL 16, RAM 64GB, 16 Cores)
+* **ฐานข้อมูล**: `wms` (ครอบคลุมทั้ง 17 Schemas: `bks`, `central`, `claim`, `dc`, `ebb`, `klh`, `ksw`, `llk`, `nck`, `nwm`, `pks`, `public`, `rtb`, `snk`, `stp`, `vsf`, `vsm`)
+* **ความปลอดภัยต่อ Production**: การ Export ใช้ `pg_dump -Fc` ซึ่งเป็น **MVCC Read-Only Snapshot** ไม่มีการล็อกตาราง (No Table Locking) และไม่กระทบการทำงานของระบบ 14 สาขา
+
+---
+
+#### 🛠️ ขั้นตอนการปฏิบัติการแบบ Step-by-Step
+
+##### ขั้นตอนที่ 1: สำรองข้อมูลเดิมบนเครื่อง UAT (`10.1.1.195`) ไว้ก่อนเสมอ
+ล็อกอินเข้าเครื่อง UAT (`ssh ubuntu@10.1.1.195`) และสั่ง Full Backup ข้อมูลเดิมเก็บไว้:
+```bash
+sudo mkdir -p /var/backups/wms_uat_backups
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+
+# 1. สำรองข้อมูล Database ทั้งหมด
+sudo -u postgres pg_dump -Fc -Z 6 -d wms -f /var/backups/wms_uat_backups/backup_wms_uat_full_${TIMESTAMP}.dump
+
+# 2. สำรอง Global Objects (Users, Roles, Tablespaces)
+sudo -u postgres pg_dumpall --globals-only > /var/backups/wms_uat_backups/backup_wms_uat_globals_${TIMESTAMP}.sql
+
+# ตรวจสอบขนาดไฟล์สำรอง
+ls -lh /var/backups/wms_uat_backups/
+```
+
+---
+
+##### ขั้นตอนที่ 2: สร้าง Dump Snapshot จาก Production (`10.1.1.9`)
+ล็อกอินเข้าเครื่อง Production (`ssh ubuntu@10.1.1.9`) และรันคำสั่ง Dump:
+```bash
+sudo mkdir -p /var/backups/wms_migration
+sudo chown -R ubuntu:postgres /var/backups/wms_migration
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+
+# รันคำสั่ง pg_dump แบบ Custom Compressed Format (-Fc)
+sudo -u postgres pg_dump -Fc -Z 6 -d wms -f /var/backups/wms_migration/wms_prod_latest_${TIMESTAMP}.dump
+
+# ตรวจสอบขนาดไฟล์ (ขนาดบีบอัดจะอยู่ที่ประมาณ 200 - 300 MB)
+ls -lh /var/backups/wms_migration/wms_prod_latest_${TIMESTAMP}.dump
+```
+
+---
+
+##### ขั้นตอนที่ 3: โอนย้ายไฟล์ Dump ไปยังเครื่อง UAT (`10.1.1.195`)
+* **กรณี Online (เชื่อมต่อเน็ตเวิร์กภายในได้)**: รันจากเครื่อง PROD หรือเครื่อง UAT:
+  ```bash
+  # ตัวอย่างรันจากเครื่อง UAT เพื่อดึงไฟล์มาจาก PROD
+  scp ubuntu@10.1.1.9:/var/backups/wms_migration/wms_prod_latest_*.dump /var/backups/wms_uat_backups/wms_prod_snapshot.dump
+  ```
+* **กรณี Offline / Air-Gapped**:
+  1. คัดลอกไฟล์ `.dump` ออกมาใส่ USB Drive หรือ Storage ภายนอก
+  2. นำไปวางไว้ที่เครื่อง UAT ที่พาธ `/var/backups/wms_uat_backups/wms_prod_snapshot.dump`
+
+---
+
+##### ขั้นตอนที่ 4: เคลียร์ฐานข้อมูลเดิมและ Restore ลงบน UAT (`10.1.1.195`)
+ล็อกอินเข้าเครื่อง UAT (`ssh ubuntu@10.1.1.195`) แล้วดำเนินการตามลำดับ:
+
+1. **ตัด Session การเชื่อมต่อที่ค้างอยู่บน Database `wms`**:
+   ```bash
+   sudo -u postgres psql -d postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'wms' AND pid <> pg_backend_pid();"
+   ```
+
+2. **ลบและสร้างฐานข้อมูล `wms` ใหม่ให้สะอาดบริสุทธิ์**:
+   ```bash
+   sudo -u postgres psql -d postgres -c "DROP DATABASE IF EXISTS wms;"
+   sudo -u postgres psql -d postgres -c "CREATE DATABASE wms WITH OWNER postgres ENCODING 'UTF8';"
+   ```
+
+3. **Restore ข้อมูลด้วย Multi-threaded (`-j 4`) เพื่อความรวดเร็ว**:
+   ```bash
+   sudo -u postgres pg_restore -j 4 -d wms /var/backups/wms_uat_backups/wms_prod_snapshot.dump
+   ```
+   *(หมายเหตุ: หากมีคำเตือนสิทธิ์ pre-existing roles สามารถปล่อยผ่านได้ตามปกติ)*
+
+---
+
+##### ขั้นตอนที่ 5: ปรับค่า Auto-Increment ID (Sequence Sync) บน UAT
+หลังจาก Restore ข้อมูลเสร็จ จำเป็นต้องอัปเดต Sequence ทุกตารางในทั้ง 17 Schemas ให้ตรงกับค่า `MAX(id)` ล่าสุด เพื่อให้ทีมทดสอบสามารถสร้าง/บันทึก Record ใหม่ได้ทันทีโดยไม่ติดข้อผิดพลาด Unique Key Violation:
+
+```bash
+sudo -u postgres psql -d wms << 'EOF'
+DO $$
+DECLARE
+    r RECORD;
+    v_max BIGINT;
+BEGIN
+    FOR r IN (
+        SELECT s.relname AS seq, n.nspname AS sch, t.relname AS tbl, a.attname AS col
+        FROM pg_class s
+        JOIN pg_depend d ON d.objid = s.oid AND d.classid = 'pg_class'::regclass
+        JOIN pg_class t ON t.oid = d.refobjid
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = d.refobjsubid
+        WHERE s.relkind = 'S'
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+    ) LOOP
+        BEGIN
+            EXECUTE format('SELECT COALESCE(MAX(%I), 1) FROM %I.%I', r.col, r.sch, r.tbl) INTO v_max;
+            EXECUTE format('SELECT setval(''%I.%I'', %s, true)', r.sch, r.seq, v_max);
+        EXCEPTION WHEN OTHERS THEN
+            -- ข้าม Sequence ที่ไม่ใช่ standard integer
+        END;
+    END LOOP;
+END $$;
+EOF
+```
+
+---
+
+##### ขั้นตอนที่ 6: อัปเดตสถิติและตรวจสอบความสมบูรณ์ (Analyze & Verify)
+1. **รัน VACUUM ANALYZE เพื่อให้ Query Planner รับรู้สถิติข้อมูลล่าสุด**:
+   ```bash
+   sudo -u postgres psql -d wms -c "VACUUM ANALYZE;"
+   ```
+
+2. **สุ่มตรวจนับจำนวนแถวข้อมูล (Row Count) เพื่อเปรียบเทียบกับ Production**:
+   ```sql
+   -- ตัวอย่างคำสั่งตรวจสอบตารางหลักของแต่ละสาขา
+   SELECT 'dc.wms_users' AS tbl, count(*) FROM dc.wms_users
+   UNION ALL
+   SELECT 'dc.wms_orders', count(*) FROM dc.wms_orders
+   UNION ALL
+   SELECT 'bks.wms_users', count(*) FROM bks.wms_users
+   UNION ALL
+   SELECT 'bks.wms_orders', count(*) FROM bks.wms_orders
+   UNION ALL
+   SELECT 'vsm.wms_users', count(*) FROM vsm.wms_users
+   UNION ALL
+   SELECT 'vsm.wms_orders', count(*) FROM vsm.wms_orders
+   UNION ALL
+   SELECT 'central.users', count(*) FROM central.users;
+   ```
+
+---
+
 ## ☸️ แนวทางการติดตั้งไปยัง Kubernetes (Talos OS + Rook-Ceph)
 
 ไฟล์ Manifest สำหรับ Kubernetes จัดเตรียมไว้ที่ `k8s/app-deployment.yaml` รองรับ **Rook-Ceph Block Storage** และ Cluster บน **Talos OS**:
