@@ -450,6 +450,113 @@ EOF
 
 ---
 
+### 8. ⏪ Runbook: คู่มือการ Rollback ฐานข้อมูล WMS-UAT กลับสู่ชุดข้อมูลทดสอบเดิม (Step-by-Step)
+
+คู่มือนี้ใช้ในกรณีที่ทีมพัฒนาหรือ QA ต้องการ **Rollback ยกเลิกข้อมูลที่ Clone มาจาก Production** เพื่อนำฐานข้อมูล **WMS-UAT (`10.1.1.195`)** กลับไปสู่สถานะและชุดข้อมูลทดสอบเดิมของ UAT ที่ได้ทำ Full Backup สำรองไว้ล่วงหน้า
+
+#### 📌 ข้อมูลระบบและไฟล์สำรอง
+* **โหนดเป้าหมาย (Target)**: `10.1.1.195` (WMS-UAT)
+* **โฟลเดอร์จัดเก็บไฟล์สำรอง**: `/var/backups/wms_uat_backups/`
+* **ไฟล์สำรองของ UAT**: `backup_wms_uat_full_database_<TIMESTAMP>.dump` (ตัวอย่าง: `backup_wms_uat_full_database_20261103_215810.dump`)
+
+---
+
+#### 🛠️ ขั้นตอนการ Rollback แบบ Step-by-Step
+
+##### ขั้นตอนที่ 1: ตรวจสอบความพร้อมของไฟล์ Backup บน UAT
+ล็อกอินเข้าเครื่อง UAT (`ssh ubuntu@10.1.1.195`) และตรวจสอบไฟล์ Dump:
+```bash
+ls -lh /var/backups/wms_uat_backups/backup_wms_uat_full_database_*.dump
+```
+*(ตรวจสอบให้แน่ใจว่าไฟล์ขนาดประมาณ 240 MB ขึ้นไป และมีสิทธิ์อ่านไฟล์ได้)*
+
+---
+
+##### ขั้นตอนที่ 2: เคลียร์ฐานข้อมูลเดิมและสร้างใหม่ (Clean Drop & Recreate)
+ตัด Session ที่ทีม Dev เชื่อมต่อค้างอยู่ และสั่งลบฐานข้อมูลเดิมด้วยคำสั่ง `WITH (FORCE)`:
+
+```bash
+# 1. ตัด Connection และลบฐานข้อมูล wms ทิ้ง
+sudo -u postgres psql -d postgres -c "DROP DATABASE IF EXISTS wms WITH (FORCE);"
+
+# 2. สร้างฐานข้อมูล wms เปล่าขึ้นมาใหม่
+sudo -u postgres psql -d postgres -c "CREATE DATABASE wms WITH OWNER postgres ENCODING 'UTF8';"
+```
+
+---
+
+##### ขั้นตอนที่ 3: Restore ข้อมูลชุดเดิมของ UAT ด้วย Multi-threaded (`-j 4`)
+รันคำสั่ง `pg_restore` โดยระบุพาธไฟล์ Dump ของ UAT:
+
+```bash
+BACKUP_FILE="/var/backups/wms_uat_backups/backup_wms_uat_full_database_20261103_215810.dump"
+
+# แนะนำให้ redirect output เข้าไฟล์ log เพื่อป้องกัน terminal buffer ค้าง
+sudo -u postgres pg_restore -j 4 -d wms "${BACKUP_FILE}" > /tmp/wms_uat_rollback.log 2>&1 || true
+
+# ตรวจสอบบรรทัดท้ายของ log เพื่อดูความเรียบร้อย
+tail -n 20 /tmp/wms_uat_rollback.log
+```
+
+---
+
+##### ขั้นตอนที่ 4: รีเซ็ตค่า Auto-Increment Sequence บน UAT
+เมื่อ Restore ข้อมูลเดิมกลับมาแล้ว ต้องรันคำสั่งปรับค่าตัวนับ Sequence ทุกตารางให้ตรงกับค่า `MAX(id)` เดิมของ UAT เพื่อป้องกันข้อผิดพลาด Duplicate Key เมื่อ Dev สร้าง Record ใหม่:
+
+```bash
+sudo -u postgres psql -d wms << 'EOF'
+DO $$
+DECLARE
+    r RECORD;
+    v_max BIGINT;
+BEGIN
+    FOR r IN (
+        SELECT s.relname AS seq, n.nspname AS sch, t.relname AS tbl, a.attname AS col
+        FROM pg_class s
+        JOIN pg_depend d ON d.objid = s.oid AND d.classid = 'pg_class'::regclass
+        JOIN pg_class t ON t.oid = d.refobjid
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = d.refobjsubid
+        WHERE s.relkind = 'S'
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+    ) LOOP
+        BEGIN
+            EXECUTE format('SELECT COALESCE(MAX(%I), 1) FROM %I.%I', r.col, r.sch, r.tbl) INTO v_max;
+            EXECUTE format('SELECT setval(''%I.%I'', %s, true)', r.sch, r.seq, v_max);
+        EXCEPTION WHEN OTHERS THEN
+            -- ข้าม Sequence ที่ไม่ใช่ standard integer
+        END;
+    END LOOP;
+END $$;
+EOF
+```
+
+---
+
+##### ขั้นตอนที่ 5: รัน VACUUM ANALYZE และตรวจสอบความถูกต้อง (Verify)
+1. **อัปเดตสถิติ Query Optimizer**:
+   ```bash
+   sudo -u postgres psql -d wms -c "VACUUM ANALYZE;"
+   ```
+
+2. **ตรวจสอบจำนวนตารางและ Row Count เพื่อยืนยันว่าข้อมูลชุด UAT เดิมกลับมาครบถ้วน**:
+   ```sql
+   -- ตรวจสอบจำนวนตารางทั้งหมดในฐานข้อมูล (ต้องได้ประมาณ 1,963 ตาราง)
+   SELECT count(*) FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema');
+
+   -- ตรวจสอบ Row count ของตารางหลักใน UAT (ค่าจะตรงกับ UAT ดั้งเดิม ไม่ใช่ Production)
+   SELECT 'dc.wms_users' AS tbl, count(*) FROM dc.wms_users
+   UNION ALL
+   SELECT 'vsm.a_vsm', count(*) FROM vsm.a_vsm
+   UNION ALL
+   SELECT 'bks.a_bks', count(*) FROM bks.a_bks
+   UNION ALL
+   SELECT 'vsm.ms_menu_item_permissions', count(*) FROM vsm.ms_menu_item_permissions;
+   ```
+   *(ตัวอย่างผลลัพธ์ชุด UAT: `vsm.a_vsm` = 42,548 แถว, `bks.a_bks` = 3,852 แถว)*
+
+---
+
 ## ☸️ แนวทางการติดตั้งไปยัง Kubernetes (Talos OS + Rook-Ceph)
 
 ไฟล์ Manifest สำหรับ Kubernetes จัดเตรียมไว้ที่ `k8s/app-deployment.yaml` รองรับ **Rook-Ceph Block Storage** และ Cluster บน **Talos OS**:
