@@ -557,6 +557,132 @@ EOF
 
 ---
 
+### 9. 🚚 Runbook: คู่มือการโอนย้ายและ Restore ข้อมูล Production Snapshot ไปยัง WMS-DEV (Step-by-Step)
+
+คู่มือนี้จัดทำขึ้นสำหรับกรณีที่ทีมพัฒนาต้องการนำข้อมูลชุดจริงของ Production (`wms_prod_latest.dump` ขนาดประมาณ 220 MB) จากที่สำรองไว้บน **WMS-UAT (`10.1.1.195`)** ไป Restore ลงบน **WMS-DEV (`10.1.1.187`)** เพื่อใช้สำหรับทดสอบแก้ Bug หรือพัฒนาฟีเจอร์ด้วยข้อมูลที่ตรงกับหน้างานจริง 100%
+
+#### 📌 ข้อมูลระบบที่เกี่ยวข้อง
+* **เครื่องต้นทางไฟล์ Dump**: `10.1.1.195` (WMS-UAT) พาธ `/var/backups/wms_uat_backups/wms_prod_latest.dump`
+* **เครื่องปลายทาง (Target)**: `10.1.1.187` (WMS-DEV, PostgreSQL 16, RAM 16GB, 16 Cores)
+* **ฐานข้อมูลเป้าหมาย**: `wms` (ครอบคลุมทั้ง 17 Schemas ของ 14 สาขา)
+
+---
+
+#### 🛠️ ขั้นตอนการปฏิบัติการแบบ Step-by-Step
+
+##### ขั้นตอนที่ 1: เตรียมโฟลเดอร์และทำ Safety Backup บนเครื่อง DEV (`10.1.1.187`)
+ล็อกอินเข้าเครื่อง DEV (`ssh ubuntu@10.1.1.187`) เพื่อสำรองข้อมูลเดิมของ DEV ไว้ก่อน:
+
+```bash
+# 1. สร้างโฟลเดอร์จัดเก็บ Backup
+sudo mkdir -p /var/backups/wms_dev_backups
+sudo chown -R ubuntu:postgres /var/backups/wms_dev_backups
+sudo chmod 775 /var/backups/wms_dev_backups
+
+# 2. สำรองข้อมูลเดิมของเครื่อง DEV เก็บไว้เป็น Safety Dump
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+sudo -u postgres pg_dump -Fc -Z 6 -d wms -f /var/backups/wms_dev_backups/backup_wms_dev_safety_${TIMESTAMP}.dump
+```
+
+---
+
+##### ขั้นตอนที่ 2: ถ่ายโอนไฟล์ Snapshot จาก UAT ไปยัง DEV
+ดำเนินการดึงไฟล์ Dump จากเครื่อง UAT (`10.1.1.195`) มายัง DEV (`10.1.1.187`):
+
+```bash
+# รันบนเครื่อง DEV เพื่อดึงไฟล์ข้าม Network มาเก็บไว้
+scp ubuntu@10.1.1.195:/var/backups/wms_uat_backups/wms_prod_latest.dump /var/backups/wms_dev_backups/wms_prod_latest.dump
+
+# ตรวจสอบขนาดไฟล์ (ต้องมีขนาดประมาณ 220 MB)
+ls -lh /var/backups/wms_dev_backups/wms_prod_latest.dump
+```
+
+---
+
+##### ขั้นตอนที่ 3: เคลียร์ฐานข้อมูลเดิมบน DEV ด้วย `DROP DATABASE ... WITH (FORCE)`
+ตัด Session ทั้งหมดที่ต่ออยู่กับฐานข้อมูล `wms` บน DEV และสร้างฐานข้อมูลเปล่าใหม่:
+
+```bash
+# 1. ตัด Connection และลบฐานข้อมูล wms ทิ้งทั้งหมด
+sudo -u postgres psql -d postgres -c "DROP DATABASE IF EXISTS wms WITH (FORCE);"
+
+# 2. สร้างฐานข้อมูล wms เปล่าขึ้นมาใหม่
+sudo -u postgres psql -d postgres -c "CREATE DATABASE wms WITH OWNER postgres ENCODING 'UTF8';"
+```
+
+---
+
+##### ขั้นตอนที่ 4: Restore ข้อมูลด้วย Multi-threaded (`-j 4`)
+รันคำสั่ง `pg_restore` โดยแบ่งงาน 4 คอร์ขนานกัน พร้อมทั้ง Redirect output เข้าไฟล์ Log:
+
+```bash
+# รันคำสั่ง pg_restore
+sudo -u postgres pg_restore -j 4 -d wms /var/backups/wms_dev_backups/wms_prod_latest.dump > /tmp/wms_dev_clean_restore.log 2>&1 || true
+
+# ตรวจสอบความเรียบร้อย
+tail -n 20 /tmp/wms_dev_clean_restore.log
+```
+*(ระยะเวลาดำเนินการประมาณ 2 – 2.5 นาที)*
+
+---
+
+##### ขั้นตอนที่ 5: รีเซ็ตค่า Auto-Increment Sequence ให้ตรงกับ Production
+ปรับค่า Sequence ทุกตารางในทั้ง 17 Schemas ให้ตรงกับ `MAX(id)` ของชุด Production เพื่อให้บันทึกข้อมูลใหม่ได้ทันที:
+
+```bash
+sudo -u postgres psql -d wms << 'EOF'
+DO $$
+DECLARE
+    r RECORD;
+    v_max BIGINT;
+BEGIN
+    FOR r IN (
+        SELECT s.relname AS seq, n.nspname AS sch, t.relname AS tbl, a.attname AS col
+        FROM pg_class s
+        JOIN pg_depend d ON d.objid = s.oid AND d.classid = 'pg_class'::regclass
+        JOIN pg_class t ON t.oid = d.refobjid
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = d.refobjsubid
+        WHERE s.relkind = 'S'
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+    ) LOOP
+        BEGIN
+            EXECUTE format('SELECT COALESCE(MAX(%I), 1) FROM %I.%I', r.col, r.sch, r.tbl) INTO v_max;
+            EXECUTE format('SELECT setval(''%I.%I'', %s, true)', r.sch, r.seq, v_max);
+        EXCEPTION WHEN OTHERS THEN
+            -- ข้าม Sequence ที่ไม่ใช่ standard integer
+        END;
+    END LOOP;
+END $$;
+EOF
+```
+
+---
+
+##### ขั้นตอนที่ 6: รัน VACUUM ANALYZE และสุ่มตรวจสอบข้อมูล (Verify)
+1. **รันคำสั่งอัปเดตสถิติ Optimizer**:
+   ```bash
+   sudo -u postgres psql -d wms -c "VACUUM ANALYZE;"
+   ```
+
+2. **ตรวจสอบความสมบูรณ์เทียบกับ Production**:
+   ```sql
+   -- ตรวจสอบจำนวนตารางทั้งหมด (ต้องได้ 1,962 ตาราง เท่ากับ Production)
+   SELECT count(*) FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema');
+
+   -- ตรวจสอบ Row count ของตารางหลัก (ตัวเลขจะตรงกับ Production 100%)
+   SELECT 'dc.wms_users' AS tbl, count(*) FROM dc.wms_users
+   UNION ALL
+   SELECT 'dc.a_dc', count(*) FROM dc.a_dc
+   UNION ALL
+   SELECT 'vsm.a_vsm', count(*) FROM vsm.a_vsm
+   UNION ALL
+   SELECT 'bks.a_bks', count(*) FROM bks.a_bks;
+   ```
+   *(ผลลัพธ์ที่ถูกต้อง: `dc.a_dc` = 42,161 แถว, `vsm.a_vsm` = 46,379 แถว, `bks.a_bks` = 3,862 แถว)*
+
+---
+
 ## ☸️ แนวทางการติดตั้งไปยัง Kubernetes (Talos OS + Rook-Ceph)
 
 ไฟล์ Manifest สำหรับ Kubernetes จัดเตรียมไว้ที่ `k8s/app-deployment.yaml` รองรับ **Rook-Ceph Block Storage** และ Cluster บน **Talos OS**:
